@@ -315,6 +315,52 @@ public:
     return true;
   }
 
+  bool is_aligned(uint64_t alignment) const {
+    if ((alignment & (alignment - 1)) == 0) {
+      uint64_t alignment_mask = ~(alignment - 1);
+      for (auto &&[_, ptr] : in) {
+        uintptr_t p = (uintptr_t)ptr.c_str();
+        if (p & ~alignment_mask) return false;
+        if ((p + ptr.length()) & ~alignment_mask) return false;
+      }
+
+      for (auto &&[_, ptr] : out) {
+        uintptr_t p = (uintptr_t)ptr.c_str();
+        if (p & ~alignment_mask) return false;
+        if ((p + ptr.length()) & ~alignment_mask) return false;
+      }
+
+      return true;
+    }
+    else {
+      for (auto &&[_, ptr] : in) {
+        uintptr_t p = (uintptr_t)ptr.c_str();
+        if (p % alignment != 0) return false;
+        if ((p + ptr.length()) % alignment != 0) return false;
+      }
+
+      for (auto &&[_, ptr] : out) {
+        uintptr_t p = (uintptr_t)ptr.c_str();
+        if (p % alignment != 0) return false;
+        if ((p + ptr.length()) % alignment != 0) return false;
+      }
+
+      return true;
+    }
+  }
+
+  // bool is_dividable_by_minimum_granularity() const {
+  //   for (auto &&[_, ptr] : in) {
+  //     if (ptr.length() % sinfo.get_chunk_size() != 0) return false;
+  //   }
+  //
+  //   for (auto &&[_, ptr] : out) {
+  //     if (ptr.length()) % sinfo.get_chunk_size() != 0) return false;
+  //   }
+  //
+  //   return true;
+  // }
+
   slice_iterator &operator++() {
     advance();
     return *this;
@@ -446,6 +492,16 @@ inline uint64_t align_next(uint64_t val) {
 
 inline uint64_t align_prev(uint64_t val) {
   return p2align(val, EC_ALIGN_SIZE);
+}
+
+inline uint64_t align_next(uint64_t val, uint64_t alignment) {
+  //return p2roundup(val, alignment);
+  return ((val + alignment - 1) / alignment) * alignment;
+}
+
+inline uint64_t align_prev(uint64_t val, uint64_t alignment) {
+  //return p2align(val, alignment);
+  return val / alignment * alignment;
 }
 
 class stripe_info_t {
@@ -612,6 +668,10 @@ public:
   }
 
   uint64_t object_size_to_shard_size(const uint64_t size, shard_id_t shard) const {
+    if (!supports_partial_writes()) {
+      uint64_t shard_size = size / get_k();
+      return align_next(shard_size, this->get_chunk_size());
+    }
     uint64_t remainder = size % get_stripe_width();
     uint64_t shard_size = (size - remainder) / k;
     raw_shard_id_t raw_shard = get_raw_shard(shard);
@@ -1039,6 +1099,7 @@ public:
   bool contains(std::optional<shard_extent_set_t> const &other) const;
   bool contains(shard_extent_set_t const &other) const;
   void pad_and_rebuild_to_ec_align();
+  void pad_and_rebuild_to_alignment(uint64_t alignment);
   uint64_t size();
   void clear();
   uint64_t get_start_offset() const { return start_offset; }

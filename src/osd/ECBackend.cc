@@ -248,8 +248,11 @@ void ECBackend::RecoveryBackend::handle_recovery_push(
   }
 
   if (op.after_progress.data_complete) {
+    dout(10)  << "JP: NEW: op.recovery_info.size " << op.recovery_info.size << dendl;
     uint64_t shard_size = sinfo.object_size_to_shard_size(op.recovery_info.size,
       get_parent()->whoami_shard().shard);
+    dout(10)  << "JP: NEW: shard_size " << shard_size << dendl;
+    dout(10)  << "JP: NEW: tobj_size " << tobj_size << dendl;
     ceph_assert(shard_size >= tobj_size);
     if (shard_size != tobj_size) {
       m->t.truncate( coll, tobj, shard_size);
@@ -397,8 +400,13 @@ void ECBackend::RecoveryBackend::handle_recovery_read_complete(
   ceph_assert(op.obc);
 
   op.returned_data.emplace(std::move(res.buffers_read));
-  uint64_t aligned_size = ECUtil::align_next(op.obc->obs.oi.size);
+  //JAMIE TODO is this right?
+  // if not support partial writes
+  uint64_t aligned_size = ECUtil::align_next(op.obc->obs.oi.size, sinfo.get_chunk_size());
+  // else
+  //uint64_t aligned_size = ECUtil::align_next(op.obc->obs.oi.size);
 
+  dout(20) << "JP: we be at recovery decode" << dendl;
   dout(20) << __func__ << " before decode: oid=" << op.hoid << " EC_DEBUG_BUFFERS: "
          << op.returned_data->debug_string(2048, 0)
          << dendl;
@@ -570,18 +578,32 @@ void ECBackend::RecoveryBackend::continue_recovery_op(
        * correctly sized reads.
        */
       uint64_t read_size = get_recovery_chunk_size();
+      dout(20) << "JP: read_size = " << read_size << dendl;
       if (op.obc) {
-        uint64_t read_to_end = ECUtil::align_next(op.obc->obs.oi.size) -
+        //uint64_t read_to_end = ECUtil::align_next(op.obc->obs.oi.size) -
+        //  op.recovery_progress.data_recovered_to;
+        uint64_t read_to_end = ECUtil::align_next(op.obc->obs.oi.size, sinfo.get_chunk_size()) -
           op.recovery_progress.data_recovered_to;
+        dout(20) << "JP: read_to_end = " << read_to_end << dendl;
 
         if (read_to_end < read_size) {
           read_size = read_to_end;
         }
       }
+      // TODO check all of this again...
+      //sinfo.ro_range_to_shard_extent_set_with_parity(
+      //  op.recovery_progress.data_recovered_to, read_size, want);
+      dout(20) << "JP: want in con_rec_op 1 " << want << dendl;
       sinfo.ro_range_to_shard_extent_set_with_parity(
-        op.recovery_progress.data_recovered_to, read_size, want);
-
+        op.recovery_progress.data_recovered_to, sinfo.ro_offset_to_next_stripe_ro_offset(read_size), want);
+      //sinfo.trim_shard_extent_set_for_ro_offset(read_size, want);
+      //dout(20) << "JP: want in con_rec_op 2 " << want << dendl;
+      dout(20) << "JP: data recovered to before add " << op.recovery_progress.data_recovered_to << dendl;
       op.recovery_progress.data_recovered_to += read_size;
+      dout(20) << "JP: data recovered to after add " << op.recovery_progress.data_recovered_to << dendl;
+      sinfo.trim_shard_extent_set_for_ro_offset(op.recovery_progress.data_recovered_to, want);
+      dout(20) << "JP: want in con_rec_op 2 " << want << dendl;
+
 
       // We only need to recover shards that are missing.
       for (auto shard : shard_id_set::difference(sinfo.get_all_shards(), op.missing_on_shards)) {
@@ -597,6 +619,12 @@ void ECBackend::RecoveryBackend::continue_recovery_op(
                                   op.obc
                                     ? op.obc->obs.oi.size
                                     : get_recovery_chunk_size());
+      if (op.obc) {
+        dout(20) << "JP: op.obc->obs.oi.size " << op.obc->obs.oi.size << dendl;
+      }
+      else {
+        dout(20) << "JP: get_recovery_chunk_size() " << get_recovery_chunk_size() << dendl;
+      }
 
       int r = read_pipeline.get_min_avail_to_read_shards(
         op.hoid, true, false, read_request);
@@ -1614,7 +1642,7 @@ void ECBackend::submit_transaction(
 
       auto [readable_shards, writable_shards] =
         read_pipeline.get_readable_writable_shard_id_sets();
-      ECTransaction::WritePlanObj plan(oid, inner_op, sinfo, readable_shards,
+      ECTransaction::WritePlanObj plan(get_parent()->get_dpp(), oid, inner_op, sinfo, readable_shards,
                                        writable_shards,
                                        object_in_cache, old_object_size,
                                        oi, soi,

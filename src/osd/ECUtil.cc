@@ -9,10 +9,21 @@
 #include "global/global_context.h"
 #include "include/encoding.h"
 
+#include "common/debug.h"
+#define dout_context g_ceph_context
+#define dout_subsys ceph_subsys_osd
+#undef dout_prefix
+#define dout_prefix _prefix(_dout)
+
 using namespace std;
 using ceph::bufferlist;
 using ceph::ErasureCodeInterfaceRef;
 using ceph::Formatter;
+
+static ostream& _prefix(std::ostream* _dout)
+{
+  return *_dout << "ECUtil: ";
+}
 
 template <typename T>
 using shard_id_map = shard_id_map<T>;
@@ -161,7 +172,8 @@ void ECUtil::stripe_info_t::trim_shard_extent_set_for_ro_offset(
       ro_offset, raw_shard_id_t(0));
     for (auto &&iter = shard_extent_set.begin(); iter != shard_extent_set.end()
          ;) {
-      iter->second.erase_after(align_next(shard_offset));
+      iter->second.erase_after(align_next(shard_offset, this->get_chunk_size()));
+      dout(10) << "JP: NEW: trim " << dendl;
       if (iter->second.empty()) iter = shard_extent_set.erase(iter);
       else ++iter;
     }
@@ -171,14 +183,23 @@ void ECUtil::stripe_info_t::trim_shard_extent_set_for_ro_offset(
 void ECUtil::stripe_info_t::ro_size_to_stripe_aligned_read_mask(
     uint64_t ro_size,
     shard_extent_set_t &shard_extent_set) const {
+  dout(10) << "JP: ro_size_to_stripe_aligned_read_mask " << ro_size << dendl;
+  dout(10) << "JP: ses1 " << shard_extent_set << dendl;
   ro_range_to_shard_extent_set_with_parity(
     0, ro_offset_to_next_stripe_ro_offset(ro_size), shard_extent_set);
+  dout(10) << "JP: ses2 " << shard_extent_set << dendl;
   trim_shard_extent_set_for_ro_offset(ro_size, shard_extent_set);
+  dout(10) << "JP: ses3 " << shard_extent_set << dendl;
 }
 
 void ECUtil::stripe_info_t::ro_size_to_read_mask(
     uint64_t ro_size,
     shard_extent_set_t &shard_extent_set) const {
+  dout(10) << "JP: ro_size_to_read_mask " << ro_size << dendl;
+  //if (!sinfo->supports_partial_writes()) {
+  ro_size_to_stripe_aligned_read_mask(ro_size, shard_extent_set);
+  return;
+  //}
   ro_range_to_shard_extent_set_with_parity(0, align_next(ro_size),
                                            shard_extent_set);
 }
@@ -186,12 +207,17 @@ void ECUtil::stripe_info_t::ro_size_to_read_mask(
 void ECUtil::stripe_info_t::ro_size_to_zero_mask(
     uint64_t ro_size,
     shard_extent_set_t &shard_extent_set) const {
+  dout(10) << "JP: ro_size_to_zero_mask " << ro_size << dendl;
   // There should never be any zero padding on the parity.
-  ro_range_to_shard_extent_set(align_next(ro_size),
+  return;
+  dout(10) << "JP: ses1 " << shard_extent_set << dendl;
+  ro_range_to_shard_extent_set(align_next(ro_size, this->get_chunk_size()),
                                ro_offset_to_next_stripe_ro_offset(ro_size) -
-                               align_next(ro_size),
+                               align_next(ro_size, this->get_chunk_size()),
                                shard_extent_set);
+  dout(10) << "JP: ses2 " << shard_extent_set << dendl;
   trim_shard_extent_set_for_ro_offset(ro_size, shard_extent_set);
+  dout(10) << "JP: ses3 " << shard_extent_set << dendl;
 }
 
 namespace ECUtil {
@@ -202,11 +228,15 @@ void shard_extent_map_t::erase_after_ro_offset(uint64_t ro_offset) {
   }
 
   shard_extent_set_t ro_to_erase(sinfo->get_k_plus_m());
+  dout(20) << "JP: ro_start " << ro_start << " ro_end " << ro_end << " ro_offset " << ro_offset << dendl;
   sinfo->ro_range_to_shard_extent_set(ro_offset, ro_end - ro_start,
                                       ro_to_erase);
+  dout(20) << "JP: ro_to_erase " << ro_to_erase << dendl;
   for (auto &&[shard, eset] : ro_to_erase) {
     if (extent_maps.contains(shard)) {
       auto &emap = extent_maps.at(shard);
+      dout(20) << "JP: eset.range_start() " << eset.range_start() << dendl;
+      dout(20) << "JP: eset.range_end() " << eset.range_end() << dendl;
       emap.erase(eset.range_start(), eset.range_end());
       if (emap.empty()) {
         extent_maps.erase(shard);
@@ -215,6 +245,7 @@ void shard_extent_map_t::erase_after_ro_offset(uint64_t ro_offset) {
   }
 
   compute_ro_range();
+  dout(20) << "JP: computed_sem " << *this << dendl;
 }
 
 shard_extent_map_t shard_extent_map_t::intersect_ro_range(
@@ -460,6 +491,7 @@ void shard_extent_map_t::insert_parity_buffers() {
   for (raw_shard_id_t raw_shard(sinfo->get_k()); raw_shard < sinfo->
        get_k_plus_m(); ++raw_shard) {
     shard_id_t shard = sinfo->get_shard(raw_shard);
+    dout(10) << "JP: shard:" << (int)shard << " raw_shard:" << (int)raw_shard << dendl;
 
     for (auto &&[offset, length] : encode_set) {
       /* No need to recreate buffers we already have */
@@ -468,7 +500,12 @@ void shard_extent_map_t::insert_parity_buffers() {
         if (emap.contains(offset, length))
           continue;
       }
+      dout(10) << "JP: creating parity buffer for shard: " << (int)shard << " raw_shard:" << (int)raw_shard << " with length: " << length << dendl;
+      dout(10) << "JP: creating parity buffer for sem: " << *this << dendl;
       bufferlist bl;
+      //if (length < sinfo->get_chunk_size()) {
+      //  length = sinfo->get_chunk_size();
+      //}
       bl.push_back(buffer::create_aligned(length, EC_ALIGN_SIZE));
       extent_maps[shard].insert(offset, length, bl);
     }
@@ -479,6 +516,7 @@ slice_iterator shard_extent_map_t::begin_slice_iterator(
     const shard_id_set &out,
     DoutPrefixProvider *dpp,
     const shard_id_set *dedup_zeros) {
+  dout(10) << "JP: BEGIN SLICE IT for " << extent_maps << dendl;
   return slice_iterator(extent_maps, out, dpp, dedup_zeros);
 }
 
@@ -490,11 +528,27 @@ int shard_extent_map_t::encode(const ErasureCodeInterfaceRef &ec_impl,
     shard_id_set *dedup_zeros) {
   shard_id_set out_set = sinfo->get_parity_shards();
   bool rebuild_req = false;
+  dout(10) << "JP: _encode() start " << dendl;
+
+  uint64_t alignment = sinfo->supports_partial_writes() ? EC_ALIGN_SIZE : sinfo->get_chunk_size();
+  dout(10) << "JP: sinfo->get_chunk_size() is " << sinfo->get_chunk_size() << dendl;
+  dout(10) << "JP: ec_impl->get_minimum_granularity() is " << ec_impl->get_minimum_granularity() << dendl;
+  dout(10) << "JP: sinfo->get_stripe_width() is " << sinfo->get_stripe_width() << dendl;
 
   for (auto iter = begin_slice_iterator(out_set, dpp, dedup_zeros); !iter.is_end(); ++iter) {
-    if (!iter.is_page_aligned()) {
-      rebuild_req = true;
-      break;
+    if (sinfo->supports_partial_writes()) {
+      if (!iter.is_page_aligned()) {
+        dout(10) << "JP: _encode iter not page aligned " << dendl;
+        rebuild_req = true;
+        break;
+      }
+    }
+    else {
+      if (iter.get_length() % sinfo->get_chunk_size() != 0) {
+        dout(10) << "iter.get_length() " << iter.get_length() << " , chunk_size " << sinfo->get_chunk_size() << dendl;
+        rebuild_req = true;
+        break;
+      }
     }
 
     shard_id_map<bufferptr> &in = iter.get_in_bufferptrs();
@@ -506,7 +560,14 @@ int shard_extent_map_t::encode(const ErasureCodeInterfaceRef &ec_impl,
   }
 
   if (rebuild_req) {
-    pad_and_rebuild_to_ec_align();
+    if (sinfo->supports_partial_writes()) {
+      dout(10) << "JP: calling pad_and_rebuild_to_ec_align " << dendl;
+      pad_and_rebuild_to_ec_align();
+    }
+    else {
+      dout(10) << "JP: calling pad_and_rebuild_to_alignment2(alignment) " << dendl;
+      pad_and_rebuild_to_alignment(alignment);
+    }
     return encode(ec_impl, dpp, dedup_zeros);
   }
 
@@ -567,38 +628,59 @@ int shard_extent_map_t::encode_parity_delta(
 
 void shard_extent_map_t::pad_on_shards(const shard_extent_set_t &pad_to,
                                        const shard_id_set &shards) {
+  //if (!sinfo->supports_partial_writes()) return;
   for (auto &shard : shards) {
     if (!pad_to.contains(shard)) {
       continue;
     }
+    // JAMIE NEW CHANGE HERE
     pad_on_shard(pad_to.at(shard), shard);
   }
 }
 
 void shard_extent_map_t::pad_on_shard(const extent_set &pad_to,
                                        const shard_id_t shard) {
-
   if (pad_to.size() == 0) {
     return;
   }
 
-  for (auto &[off, length] : pad_to) {
-    bufferlist bl;
-    uint64_t start = align_prev(off);
-    uint64_t end = align_next(off + length);
+  if (sinfo->supports_partial_writes()) {
+    for (auto &[off, length] : pad_to) {
+      dout(10) << "JP: pad_on_shard orig " << dendl;
+      dout(10) << "JP: pad_on_shard " << shard << " length " << length << dendl;
+      bufferlist bl;
+      uint64_t start = align_prev(off);
+      uint64_t end = align_next(off + length);
 
-    bl.push_back(buffer::create_aligned(end - start, EC_ALIGN_SIZE));
-    insert_in_shard(shard, start, bl);
+      bl.push_back(buffer::create_aligned(end - start, EC_ALIGN_SIZE));
+      insert_in_shard(shard, start, bl);
+    }
+  }
+  else {
+    for (auto &[off, length] : pad_to) {
+      dout(10) << "JP: pad_on_shard my new one " << dendl;
+      dout(10) << "JP: pad_on_shard " << shard << " off" << off << " length " << length << dendl;
+      bufferlist bl;
+      uint64_t start = off;
+      uint64_t end = off + length;
+      //uint64_t start = align_prev(off, sinfo->get_chunk_size());
+      //uint64_t end = align_next(off + length, sinfo->get_chunk_size());
+
+      bl.push_back(buffer::create_aligned(end - start, EC_ALIGN_SIZE));
+      insert_in_shard(shard, start, bl);
+    }
   }
 }
 
 void shard_extent_map_t::pad_on_shards(const extent_set &pad_to,
                                        const shard_id_set &shards) {
 
+  //if (!sinfo->supports_partial_writes()) return;
   if (pad_to.size() == 0) {
     return;
   }
   for (auto &shard : shards) {
+    // JAMIE NEW CHANGE HERE
     pad_on_shard(pad_to, shard);
   }
 }
@@ -641,15 +723,19 @@ int shard_extent_map_t::decode(const ErasureCodeInterfaceRef &ec_impl,
                                uint64_t object_size,
                                DoutPrefixProvider *dpp,
                                bool dedup_zeros) {
+    dout(10) << "JP: in decode " << dendl;
   shard_id_set want_set;
   shard_id_set have_set;
   want.populate_shard_id_set(want_set);
   extent_maps.populate_bitset_set(have_set);
+  dout(10) << "JP: want_set " << want_set << dendl;
+  dout(10) << "JP: have_set " << have_set << dendl;
 
   shard_id_set need_set = shard_id_set::difference(want_set, have_set);
 
   /* Optimise the no-op */
   if (need_set.empty()) {
+    dout(10) << "JP: decode no-op " << dendl;
     return 0;
   }
 
@@ -685,12 +771,20 @@ int shard_extent_map_t::decode(const ErasureCodeInterfaceRef &ec_impl,
   }
 
   int r = 0;
+  dout(10) << "JP: need_set " << need_set << dendl;
+  dout(10) << "JP: want_set " << want_set << dendl;
+  dout(10) << "JP: encode_set " << encode_set << dendl;
+  dout(10) << "JP: decode_set " << decode_set << dendl;
+  dout(10) << "JP: want before pad " << want << dendl;
   if (!decode_set.empty()) {
+    dout(10) << "JP: SEM pre pad_on_shards " << *this << dendl;
     pad_on_shards(want, decode_set);
+    dout(10) << "JP: SEM post pad_on_shards " << *this << dendl;
     r = _decode(ec_impl, want_set, decode_set, dpp);
   }
   if (!r && !encode_set.empty()) {
     pad_on_shards(get_extent_superset(), sinfo->get_parity_shards());
+    dout(10) << "JP: calling decode encode " << dendl;
     r = encode(ec_impl, dpp, dedup_zeros?&need_set:nullptr);
   }
 
@@ -703,7 +797,10 @@ int shard_extent_map_t::decode(const ErasureCodeInterfaceRef &ec_impl,
    * they can invent buffers outside the want extent_set which are actually
    * invalid.  So here, we trim off those buffers.
    */
-  trim(want);
+  //if (sinfo->supports_partial_writes()) {
+  dout(10) << "JP: want for trim " << want << dendl;
+    trim(want);
+  //}
 
   return 0;
 }
@@ -713,11 +810,26 @@ int shard_extent_map_t::_decode(const ErasureCodeInterfaceRef &ec_impl,
                                 const shard_id_set &need_set,
                                 DoutPrefixProvider *dpp) {
   bool rebuild_req = false;
-
+  dout(10) << "JP: _decode() start " << dendl;
+  dout(10) << "JP: want set " << want_set << dendl;
+  dout(10) << "JP: need set " << need_set << dendl;
+  uint64_t alignment = sinfo->supports_partial_writes() ? EC_ALIGN_SIZE : sinfo->get_chunk_size();
+  dout(10) << "JP: sinfo->get_chunk_size() is " << sinfo->get_chunk_size() << dendl;
+  dout(10) << "JP: ec_impl->get_minimum_granularity() is " << ec_impl->get_minimum_granularity() << dendl;
+  dout(10) << "JP: sinfo->get_stripe_width() is " << sinfo->get_stripe_width() << dendl;
   for (auto iter = begin_slice_iterator(need_set, dpp); !iter.is_end(); ++iter) {
-    if (!iter.is_page_aligned()) {
-      rebuild_req = true;
-      break;
+    if (sinfo->supports_partial_writes()) {
+      if (!iter.is_page_aligned()) {
+        dout(10) << "JP: _encode iter not page aligned " << dendl;
+        rebuild_req = true;
+        break;
+      }
+    }
+    else {
+      if (iter.get_length() % sinfo->get_chunk_size() != 0) {
+        rebuild_req = true;
+        break;
+      }
     }
 
     shard_id_map<bufferptr> &in = iter.get_in_bufferptrs();
@@ -727,13 +839,21 @@ int shard_extent_map_t::_decode(const ErasureCodeInterfaceRef &ec_impl,
       continue;
     }
 
+    dout(10) << "JP: calling decode_chunks " << dendl;
     if (int ret = ec_impl->decode_chunks(want_set, in, out)) {
       return ret;
     }
   }
 
   if (rebuild_req) {
-    pad_and_rebuild_to_ec_align();
+    if (sinfo->supports_partial_writes()) {
+      dout(10) << "JP: calling pad_and_rebuild_to_ec_align " << dendl;
+      pad_and_rebuild_to_ec_align();
+    }
+    else {
+      dout(10) << "JP: calling pad_and_rebuild_to_alignment2(alignment) " << dendl;
+      pad_and_rebuild_to_alignment(alignment);
+    }
     return _decode(ec_impl, want_set, need_set, dpp);
   }
 
@@ -775,6 +895,67 @@ void shard_extent_map_t::pad_and_rebuild_to_ec_align() {
         // We are not permitted to modify the emap while iterating.
         aligned.insert(start, end - start, bl);
       }
+      if (resized_i) resized = true;
+    }
+    emap.insert(aligned);
+  }
+
+  if (resized) {
+    compute_ro_range();
+  }
+}
+
+const unsigned SIMD_ALIGN = 64;
+void shard_extent_map_t::pad_and_rebuild_to_alignment(uint64_t alignment) {
+  bool resized = false;
+  for (auto &&[shard, emap] : extent_maps) {
+    extent_map aligned;
+
+    // Inserting while iterating is not supported in extent maps, make the
+    // iterated-over emap const to help defend against mistakes.
+    const extent_map &cemap = emap;
+    for (auto i = cemap.begin(); i != cemap.end(); ++i) {
+      dout(10) << "JP: start: " << i.get_off() << dendl;
+      dout(10) << "JP: aligned_start: " << i.get_off() / alignment * alignment << dendl;
+      dout(10) << "JP: end: " << i.get_off() + i.get_len() << dendl;
+      dout(10) << "JP: aligned_end: " << (i.get_off() + i.get_len() + alignment -1) / alignment * alignment << dendl;
+      bool resized_i = false;
+      bufferlist bl = i.get_val();
+      uint64_t start = i.get_off();
+      uint64_t aligned_start = start / alignment * alignment;
+      uint64_t end = start + i.get_len();
+      uint64_t aligned_end = (end + alignment - 1) / alignment * alignment;
+      //
+      if (start != aligned_start) {
+        bl.prepend_zero(start - aligned_start);
+        start = aligned_start;
+        resized_i = true;
+      }
+      if (end != aligned_end) {
+        bl.append_zero(aligned_end - end);
+        end = aligned_end;
+        resized_i = true;
+      }
+      uint64_t new_len = bl.length();
+      if (bl.length() < alignment) {
+        dout(10) << "JP: bl.length() < alignment " << dendl;
+        new_len = alignment;
+      }
+      else if (bl.length() % alignment != 0) {
+        dout(10) << "bl.length() % alignment != 0 " << dendl;
+        new_len = (bl.length() + alignment - 1) / alignment * alignment;
+      }
+      dout(10) << "JP: new_len: " << new_len << dendl;
+      dout(10) << "JP: end - start: " << end - start << dendl;
+
+      dout(10) << "JP: resized_i: " << resized_i << dendl;
+      if (bl.rebuild_aligned_size_and_memory(new_len, SIMD_ALIGN) ||
+        resized_i) {
+        // We are not permitted to modify the emap while iterating.
+        dout(10) << "JP: inserting to aligned: " << dendl;
+        aligned.insert(start, end - start, bl);
+        }
+      dout(10) << "JP: in the end... bl.len isssss: " << bl.length() << dendl;
       if (resized_i) resized = true;
     }
     emap.insert(aligned);

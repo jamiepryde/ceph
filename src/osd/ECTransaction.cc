@@ -58,7 +58,16 @@ void ECTransaction::Generate::encode_and_write() {
       }
 
       for (auto [off, len]: eset) {
-        to_write.zero_pad(shard, off, len);
+        ldpp_dout(dpp, 20) << " JP: len in eset: " << len << dendl;
+        ldpp_dout(dpp, 20) << " JP : chunk size is: " << sinfo.get_chunk_size() << dendl;
+        if (len % sinfo.get_chunk_size() != 0) {
+          ldpp_dout(dpp, 20) << " JP: going to superpad " << dendl;
+          to_write.zero_pad(shard, off, len + (sinfo.get_chunk_size() - len % sinfo.get_chunk_size()));
+        }
+        else {
+          ldpp_dout(dpp, 20) << " JP: going to normalpad " << dendl;
+          to_write.zero_pad(shard, off, len);
+        }
       }
     }
   }
@@ -117,6 +126,7 @@ void ECTransaction::Generate::encode_and_write() {
 }
 
 ECTransaction::WritePlanObj::WritePlanObj(
+    DoutPrefixProvider *dpp,
     const hobject_t &hoid,
     const PGTransaction::ObjectOperation &op,
     const ECUtil::stripe_info_t &sinfo,
@@ -146,17 +156,32 @@ ECTransaction::WritePlanObj::WritePlanObj(
 
   /* Calculate any non-aligned pages. These need to be read and written */
   extent_set aligned_ro_writes(unaligned_ro_writes);
-  aligned_ro_writes.align(EC_ALIGN_SIZE);
+  if (sinfo.supports_partial_writes()) {
+    aligned_ro_writes.align(EC_ALIGN_SIZE);
+  }
+  else {
+    aligned_ro_writes.align(sinfo.get_chunk_size());
+  }
   extent_set partial_page_ro_writes(aligned_ro_writes);
   partial_page_ro_writes.subtract(unaligned_ro_writes);
-  partial_page_ro_writes.align(EC_ALIGN_SIZE);
+  if (sinfo.supports_partial_writes()) {
+    partial_page_ro_writes.align(EC_ALIGN_SIZE);
+  }
+  else {
+    partial_page_ro_writes.align(sinfo.get_chunk_size());
+  }
 
   extent_set write_superset;
   for (auto &&[off, len] : unaligned_ro_writes) {
     sinfo.ro_range_to_shard_extent_set_with_superset(
       off, len, will_write, write_superset);
   }
-  write_superset.align(EC_ALIGN_SIZE);
+  if (sinfo.supports_partial_writes()) {
+    write_superset.align(EC_ALIGN_SIZE);
+  }
+  else {
+    write_superset.align(sinfo.get_chunk_size());
+  }
 
   shard_id_set writable_parity_shards = shard_id_set::intersection(sinfo.get_parity_shards(), writable_shards);
   if (write_superset.size() > 0) {
@@ -174,7 +199,11 @@ ECTransaction::WritePlanObj::WritePlanObj(
       will_write.align(sinfo.get_chunk_size());
       reads = will_write;
       sinfo.ro_size_to_read_mask(sinfo.ro_offset_to_next_stripe_ro_offset(orig_size), read_mask);
+      ldpp_dout(dpp, 20) << "JP: reads pre intersection: " << reads << dendl;
       reads.intersection_of(read_mask);
+      ldpp_dout(dpp, 20) << "JP: reads post intersection: " << reads << dendl;
+      ldpp_dout(dpp, 20) << "JP: will_write: " << will_write << dendl;
+      ldpp_dout(dpp, 20) << "JP: read_mask: " << read_mask << dendl;
       do_parity_delta_write = false;
     } else {
       will_write.align(EC_ALIGN_SIZE);
@@ -194,7 +223,7 @@ ECTransaction::WritePlanObj::WritePlanObj(
       }
 
       /* We now need to add in the partial page ro writes. This is not particularly
-       * efficient as the are many divs in here, but non-4k aligned writes are
+       * efficient as there are many divs in here, but non-4k aligned writes are
        * not very efficient anyway
        */
       for (auto &&[off, len] : partial_page_ro_writes) {
@@ -256,10 +285,15 @@ ECTransaction::WritePlanObj::WritePlanObj(
   if (op.truncate && op.truncate->first < orig_size) {
     ECUtil::shard_extent_set_t truncate_read(sinfo.get_k_plus_m());
     uint64_t prev_stripe = sinfo.ro_offset_to_prev_stripe_ro_offset(op.truncate->first);
-    uint64_t next_align = ECUtil::align_next(op.truncate->first);
+    ldpp_dout(dpp, 20) << "JP: prev_stripe: " << prev_stripe << dendl;
+    //TODO JP - This looks like where truncate is going badly on recovery
+    // need to add some debug here...
+    uint64_t next_align = ECUtil::align_next(op.truncate->first, sinfo.get_chunk_size());
+    ldpp_dout(dpp, 20) << "JP: next_align: " << next_align << dendl;
     sinfo.ro_range_to_shard_extent_set(
       prev_stripe, next_align - prev_stripe,
       truncate_read);
+    ldpp_dout(dpp, 20) << "JP: truncate_read: " << truncate_read << dendl;
 
     /* Unless we are doing a full stripe write, we must always read the data
      * for the partial stripe and update the parity. For the purposes of
@@ -269,7 +303,14 @@ ECTransaction::WritePlanObj::WritePlanObj(
 
     if (next_align != 0) {
       truncate_write = truncate_read.at(shard_id_t(0));
-      truncate_write.align(EC_ALIGN_SIZE);
+      ldpp_dout(dpp, 20) << "JP: truncate_write 1: " << truncate_write << dendl;
+      if (sinfo.supports_partial_writes()) {
+        truncate_write.align(EC_ALIGN_SIZE);
+      }
+      else {
+        truncate_write.align(sinfo.get_chunk_size());
+      }
+      ldpp_dout(dpp, 20) << "JP: truncate_write 2: " << truncate_write << dendl;
     }
 
     if (!truncate_read.empty()) {
@@ -278,6 +319,7 @@ ECTransaction::WritePlanObj::WritePlanObj(
       } else {
         to_read = std::move(truncate_read);
       }
+      ldpp_dout(dpp, 20) << "JP: to_read: " << to_read << dendl;
 
       // We only need to update the parity buffer for the write
       for (auto && shard : sinfo.get_parity_shards()) {
@@ -285,6 +327,9 @@ ECTransaction::WritePlanObj::WritePlanObj(
       }
     }
   }
+
+  /* Some erasure coding plugins / techniques require shards to be multiples
+   * of chunk sizes. Pad out shards as required. */
 
   /* validate post conditions:
    * to_read should have an entry for `obj` if it isn't empty
@@ -561,7 +606,9 @@ ECTransaction::Generate::Generate(PGTransaction &t,
   written_map->emplace(oid, std::move(to_write));
 
   if (entry && plan.orig_size < plan.projected_size) {
-    entry->mod_desc.append(ECUtil::align_next(plan.orig_size));
+    ldpp_dout(dpp, 20) << " JP: calling append " << dendl;
+    entry->mod_desc.append(ECUtil::align_next(plan.orig_size, sinfo.get_chunk_size()));
+    ldpp_dout(dpp, 20) << "JP: NEW: mod_desc " << dendl;
   }
 
   // On a size change or when clearing whiteout,
@@ -652,7 +699,7 @@ void ECTransaction::Generate::truncate() {
     for (auto &&[shard, eset]: truncate_eset) {
       clone_shards.insert(shard);
       uint64_t start = eset.range_start();
-      uint64_t start_align_prev = ECUtil::align_prev(start);
+      uint64_t start_align_prev = ECUtil::align_prev(start, sinfo.get_chunk_size());
       uint64_t end = eset.range_end();
 
       if (clone_start > start_align_prev) {
@@ -670,7 +717,8 @@ void ECTransaction::Generate::truncate() {
 
       auto &t = transactions.at(shard);
       uint64_t start = eset.range_start();
-      uint64_t start_align_next = ECUtil::align_next(start);
+      uint64_t start_align_next = ECUtil::align_next(start, sinfo.get_chunk_size());
+      ldpp_dout(dpp, 20) << "JP: NEW: truncate code start_align_next " << start_align_next << dendl;
       uint64_t end = eset.range_end();
       t.touch(
         coll_t(spg_t(pgid, shard)),
@@ -735,27 +783,36 @@ void ECTransaction::Generate::overlay_writes() {
 void ECTransaction::Generate::appends_and_clone_ranges() {
 
   extent_set clone_ranges = plan.will_write.get_extent_superset();
-  uint64_t clone_max = ECUtil::align_next(plan.orig_size);
+  uint64_t clone_max = plan.orig_size;
   ldpp_dout(dpp, 20) << __func__ << dendl;
 
   if (op.delete_first) {
     clone_max = 0;
   } else if (op.truncate && op.truncate->first < clone_max) {
-    clone_max = ECUtil::align_next(op.truncate->first);
+    clone_max = op.truncate->first;
   }
+
   ECUtil::shard_extent_set_t cloneable_range(sinfo.get_k_plus_m());
+  ldpp_dout(dpp, 20) << "JP: clone_max " << clone_max << dendl;
+  ldpp_dout(dpp, 20) << "JP: cloneable_range 1 " << cloneable_range << dendl;
   sinfo.ro_size_to_read_mask(clone_max, cloneable_range);
+  ldpp_dout(dpp, 20) << "JP: cloneable_range 2 " << cloneable_range << dendl;
 
   if (plan.orig_size < plan.projected_size) {
+    ldpp_dout(dpp, 20) << "JP: plan.orig_size < plan.projected_size " << dendl;
     ECUtil::shard_extent_set_t projected_cloneable_range(sinfo.get_k_plus_m());
     sinfo.ro_size_to_read_mask(plan.projected_size,projected_cloneable_range);
+    ldpp_dout(dpp, 20) << "JP: plan.projected_size " << plan.projected_size << dendl;
+    ldpp_dout(dpp, 20) << "JP: projected_cloneable_range " << projected_cloneable_range << dendl;
 
     for (auto &&[shard, eset]: projected_cloneable_range) {
       uint64_t old_shard_size = 0;
       if (cloneable_range.contains(shard)) {
         old_shard_size = cloneable_range.at(shard).range_end();
+        ldpp_dout(dpp, 20) << "JP: old_shard_size " << old_shard_size << dendl;
       }
       uint64_t new_shard_size = eset.range_end();
+      ldpp_dout(dpp, 20) << "JP: new_shard_size " << new_shard_size << dendl;
 
       if (new_shard_size == old_shard_size) {
         continue;
@@ -764,9 +821,11 @@ void ECTransaction::Generate::appends_and_clone_ranges() {
       uint64_t write_end = 0;
       if (plan.will_write.contains(shard)) {
         write_end = plan.will_write.at(shard).range_end();
+        ldpp_dout(dpp, 20) << "JP: write_end " << write_end << dendl;
       }
 
       if (write_end == new_shard_size) {
+        ldpp_dout(dpp, 20) << "JP: write_end == new_shard_size" << dendl;
         continue;
       }
 
@@ -780,6 +839,7 @@ void ECTransaction::Generate::appends_and_clone_ranges() {
        */
       if (transactions.contains(shard)) {
         auto &t = transactions.at(shard);
+        ldpp_dout(dpp, 20) << "JP: going to truncate" << dendl;
         t.truncate(
           coll_t(spg_t(pgid, shard)),
           ghobject_t(oid, ghobject_t::NO_GEN, shard),
@@ -858,10 +918,12 @@ void ECTransaction::Generate::appends_and_clone_ranges() {
 void ECTransaction::Generate::written_and_present_shards() {
   if (entry) {
     if (!rollback_extents.empty()) {
+      ldpp_dout(dpp, 20) << "JP: NEW: rollback " << dendl;
       entry->mod_desc.rollback_extents(
         entry->version.version,
         rollback_extents,
-        ECUtil::align_next(plan.orig_size),
+        //ECUtil::align_next(plan.orig_size),
+        ECUtil::align_next(plan.orig_size, sinfo.get_chunk_size()),
         rollback_shards);
     }
     if (entry->written_shards.size() == sinfo.get_k_plus_m()) {
