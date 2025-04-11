@@ -646,7 +646,7 @@ ceph::io_sequence::tester::SelectErasureProfile::select() {
       erasure_code_profile["c"] = std::to_string(*profile.c);
     }
     if (profile.w) {
-      erasure_code_profile["packetsize"] = std::to_string(*profile.w);
+      erasure_code_profile["w"] = std::to_string(*profile.w);
     }
     if (profile.jerasure_per_chunk_alignment) {
       erasure_code_profile["jerasure_per_chunk_alignment"] =

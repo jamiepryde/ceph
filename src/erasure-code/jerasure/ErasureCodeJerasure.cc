@@ -106,9 +106,11 @@ unsigned int ErasureCodeJerasure::get_chunk_size(unsigned int stripe_width) cons
 int ErasureCodeJerasure::encode_chunks(const set<int> &want_to_encode,
 				       map<int, bufferlist> *encoded)
 {
+  dout(10) << "JP: using deprecated encode" << dendl;
   char *chunks[k + m];
   for (int i = 0; i < k + m; i++)
     chunks[i] = (*encoded)[i].c_str();
+  dout(10) << "JP: deprecated size in jerasure is " << (*encoded)[0].length() << dendl;
   jerasure_encode(&chunks[0], &chunks[k], (*encoded)[0].length());
   return 0;
 }
@@ -138,6 +140,8 @@ int ErasureCodeJerasure::encode_chunks(const shard_id_map<bufferptr> &in,
     chunks[static_cast<int>(shard)] = ptr.c_str();
   }
 
+  dout(10) << "JP: size in jerasure is " << size << dendl;
+
   char *zeros = nullptr;
 
   for (shard_id_t i; i < k + m; ++i) {
@@ -148,10 +152,13 @@ int ErasureCodeJerasure::encode_chunks(const shard_id_map<bufferptr> &in,
       memset(zeros, 0, size);
     }
 
+    dout(10) << "JP: setting " << i << " to zeroes" << dendl;
     chunks[static_cast<int>(i)] = zeros;
   }
 
+  dout(10) << "JP: calling jerasure_encode " << dendl;
   jerasure_encode(&chunks[0], &chunks[k], size);
+  dout(10) << "JP: jerasure_encode done" << dendl;
 
   if (zeros != nullptr) free(zeros);
 
@@ -189,6 +196,7 @@ int ErasureCodeJerasure::decode_chunks(const shard_id_set &want_to_read,
                                   shard_id_map<bufferptr> &in,
                                   shard_id_map<bufferptr> &out)
 {
+  dout(10) << "JP: in jerasure decode_chunks" << dendl;
   unsigned int size = 0;
   shard_id_set erasures_set;
   shard_id_set to_free;
@@ -199,15 +207,18 @@ int ErasureCodeJerasure::decode_chunks(const shard_id_set &want_to_read,
   char *coding[m];
   memset(data, 0, sizeof(char*) * k);
   memset(coding, 0, sizeof(char*) * m);
+  dout(10) << "JP: k is " << k << dendl;
+  dout(10) << "JP: m is " << m << dendl;
 
   for (auto &&[shard, ptr] : in) {
     if (size == 0) size = ptr.length();
     else ceph_assert(size == ptr.length());
     if (shard < k) {
-      data[static_cast<int>(shard)] = const_cast<char*>(ptr.c_str());
+      data[static_cast<int>(shard)] = ptr.c_str();
     } else {
-      coding[static_cast<int>(shard) - k] = const_cast<char*>(ptr.c_str());
+      coding[static_cast<int>(shard) - k] = ptr.c_str();
     }
+    dout(10) << "JP: in loop, shard " << shard << " size " << size << dendl;
     erasures_set.erase(shard);
   }
 
@@ -215,11 +226,12 @@ int ErasureCodeJerasure::decode_chunks(const shard_id_set &want_to_read,
     if (size == 0) size = ptr.length();
     else ceph_assert(size == ptr.length());
     if (shard < k) {
-      data[static_cast<int>(shard)] = const_cast<char*>(ptr.c_str());
+      data[static_cast<int>(shard)] = ptr.c_str();
     } else {
-      coding[static_cast<int>(shard) - k] = const_cast<char*>(ptr.c_str());
+      coding[static_cast<int>(shard) - k] = ptr.c_str();
     }
     erasures_set.insert(shard);
+    dout(10) << "JP: out loop, shard " << shard << " size " << size << dendl;
   }
 
   for (int i = 0; i < k + m; i++) {
@@ -228,6 +240,7 @@ int ErasureCodeJerasure::decode_chunks(const shard_id_set &want_to_read,
       *buf = (char *)malloc(size);
       to_free.insert(shard_id_t(i));
       /* If we are inventing a buffer for non-erasure shard, its zeros! */
+      dout(10) << "JP: inserting a buffer at " << i << dendl;
       if (i < k && !erasures_set.contains(shard_id_t(i))) {
         memset(*buf, 0, size);
       }
@@ -235,6 +248,7 @@ int ErasureCodeJerasure::decode_chunks(const shard_id_set &want_to_read,
   }
 
   for (auto && shard : erasures_set) {
+    dout(10) << "JP: shard " << shard << " being set to erasures " << erasures_count << dendl;
     erasures[erasures_count++] = static_cast<int>(shard);
   }
   erasures[erasures_count] = -1;
@@ -247,6 +261,7 @@ int ErasureCodeJerasure::decode_chunks(const shard_id_set &want_to_read,
     free(*buf);
     *buf = nullptr;
   }
+  dout(10) << "JP: decode_chunks r is " << r << dendl;
   return r;
 }
 

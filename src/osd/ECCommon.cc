@@ -225,6 +225,7 @@ int ECCommon::ReadPipeline::get_min_avail_to_read_shards(
   shard_id_map<pg_shard_t> shards(sinfo.get_k_plus_m());
 
   get_all_avail_shards(hoid, have, shards, for_recovery, error_shards);
+  dout(20) << "JP: shards are: " << shards << dendl;
 
   std::unique_ptr<shard_id_map<vector<pair<int, int>>>> need_sub_chunks =
       nullptr;
@@ -547,6 +548,7 @@ void ECCommon::ReadPipeline::get_want_to_read_shards(
     ECUtil::shard_extent_set_t &want_shard_reads) {
   if (sinfo.supports_partial_reads()) {
     // Optimised.
+    dout(10) << "JP: optimised reads " << want_shard_reads << dendl;
     for (const auto &single_region: to_read) {
       get_min_want_to_read_shards(single_region, want_shard_reads);
     }
@@ -554,11 +556,13 @@ void ECCommon::ReadPipeline::get_want_to_read_shards(
   }
 
   // Non-optimised version.
+  dout(10) << "JP: non-optimised reads " << want_shard_reads << dendl;
   for (const shard_id_t shard: sinfo.get_data_shards()) {
     for (auto &&read: to_read) {
       auto &&[offset, len] = sinfo.chunk_aligned_ro_range_to_shard_ro_range(
         read.offset, read.size);
       want_shard_reads[shard].union_insert(offset, len);
+      dout(10) << "JP: non-optimised reads len is " << len << dendl;
     }
   }
 }
@@ -623,8 +627,33 @@ struct ClientReadCompleter final : ECCommon::ReadCompleter {
       dout(20) << __func__ << ": before decode: "
                << res.buffers_read.debug_string(2048, 0)
                << dendl;
+       /* Try zero padding the read buffers? */
+       //if (!res.sinfo.supports_partial_writes()) { //TODO need sinfo
+         //for (auto &&[shard, eset]: res.processed_read_requests) {
+           //if (sinfo.get_raw_shard(shard) >= sinfo.get_k()) {
+           //if (shard >= 2) {
+            // continue;
+           //}
+
+           //for (auto [off, len]: eset) {
+             //dout(20) << " JP:N len in eset: " << len << dendl;
+             //dout(20) << " JP:N chunk size is: " << sinfo.get_chunk_size() << dendl;
+             // if (len % sinfo.get_chunk_size() != 0) {
+             //   ldpp_dout(dpp, 20) << " JP: going to superpad " << dendl;
+             //   to_write.zero_pad(shard, off, len + (sinfo.get_chunk_size() - len % sinfo.get_chunk_size()));
+             // }
+             // else {
+               //res.buffers_read.zero_pad(shard, off, len);
+             //res.buffers_read.zero_pad(shard, off, 57344);
+                 //res.buffers_read.zero_pad(shard, off, sinfo.get_chunk_size());
+             //}
+           //}
+         //}
+
       /* Decode any missing buffers */
       res.buffers_read.add_zero_padding_for_decode(req.zeros_for_decode);
+      dout(20) << "JP: we be at completion decode " << dendl;
+      dout(20) << "JP: object size at completion decode " << req.object_size << dendl;
       int r = res.buffers_read.decode(read_pipeline.ec_impl,
                                   req.shard_want_to_read,
                                   req.object_size,
@@ -1289,8 +1318,10 @@ void ECCommon::RecoveryBackend::handle_recovery_read_complete(
   ceph_assert(op.obc);
 
   op.returned_data.emplace(std::move(res.buffers_read));
-  uint64_t aligned_size = ECUtil::align_next(op.obc->obs.oi.size);
+  //uint64_t aligned_size = ECUtil::align_next(op.obc->obs.oi.size);
+  uint64_t aligned_size = ECUtil::align_next(op.obc->obs.oi.size, sinfo.get_chunk_size());
 
+  dout(20) << "JP: we be at recovery decode" << dendl;
   dout(20) << __func__ << " before decode: oid=" << op.hoid << " EC_DEBUG_BUFFERS: "
          << op.returned_data->debug_string(2048, 0)
          << dendl;
@@ -1415,7 +1446,7 @@ void ECCommon::RecoveryBackend::continue_recovery_op(
        */
       uint64_t read_size = get_recovery_chunk_size();
       if (op.obc) {
-        uint64_t read_to_end = ECUtil::align_next(op.obc->obs.oi.size) -
+        uint64_t read_to_end = ECUtil::align_next(op.obc->obs.oi.size, sinfo.get_chunk_size()) -
           op.recovery_progress.data_recovered_to;
 
         if (read_to_end < read_size) {
@@ -1423,9 +1454,10 @@ void ECCommon::RecoveryBackend::continue_recovery_op(
         }
       }
       sinfo.ro_range_to_shard_extent_set_with_parity(
-        op.recovery_progress.data_recovered_to, read_size, want);
+        op.recovery_progress.data_recovered_to, sinfo.ro_offset_to_next_stripe_ro_offset(read_size), want);
 
       op.recovery_progress.data_recovered_to += read_size;
+      sinfo.trim_shard_extent_set_for_ro_offset(op.recovery_progress.data_recovered_to, want);
 
       // We only need to recover shards that are missing.
       for (auto shard : shard_id_set::difference(sinfo.get_all_shards(), op.missing_on_shards)) {

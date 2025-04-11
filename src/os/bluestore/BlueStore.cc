@@ -18479,6 +18479,7 @@ int BlueStore::_clone_range(TransContext *txc,
     r = -E2BIG;
     goto out;
   }
+  dout(20) << "JP: BS: srcoff " << srcoff << " length " << length << " oldo->onode.size " << oldo->onode.size << dendl;
   if (srcoff + length > oldo->onode.size) {
     r = -EINVAL;
     goto out;

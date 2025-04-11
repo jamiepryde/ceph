@@ -307,7 +307,11 @@ public:
 
   uint64_t object_size_to_shard_size(const uint64_t size, shard_id_t shard
     ) const {
-    return sinfo.object_size_to_shard_size(size, shard);
+    //return sinfo.object_size_to_shard_size(size, shard);
+     if (size == std::numeric_limits<uint64_t>::max()) {
+       return size;
+     }
+     return (size + sinfo.get_stripe_width() - 1)/ sinfo.get_stripe_width() * sinfo.get_chunk_size();
   }
 
   uint64_t get_is_nonprimary_shard(shard_id_t shard) const {
