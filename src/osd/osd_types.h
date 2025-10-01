@@ -1067,6 +1067,10 @@ WRITE_CLASS_ENCODER_FEATURES(objectstore_perf_stat_t)
 #define PG_STATE_FAILED_REPAIR      (1ULL << 32) // A repair failed to fix all errors
 #define PG_STATE_LAGGY              (1ULL << 33) // PG is laggy/unreabable due to slow/delayed pings
 #define PG_STATE_WAIT               (1ULL << 34) // PG is waiting for prior intervals' readable period to expire
+#define PG_STATE_MIGRATION_WAIT     (1ULL << 35) // PG is waiting to start migration to a new pool
+#define PG_STATE_MIGRATING          (1ULL << 36) // PG is migrating
+#define PG_STATE_MIGRATION_TOOFULL  (1ULL << 37) // PG migration can't proceed: too full
+#define PG_STATE_MIGRATION_UNFOUND  (1ULL << 38) // PG migration can't proceed: unreadable object
 
 std::string pg_state_string(uint64_t state);
 std::string pg_vector_string(const std::vector<int32_t> &a);
@@ -1673,6 +1677,23 @@ public:
                                      ///< user does not specify any expected value
   bool fast_read = false;            ///< whether turn on fast read on the pool or not
   shard_id_set nonprimary_shards; ///< EC partial writes: shards that cannot become a primary
+
+  // Pool migration
+  std::optional<int64_t> migration_src; ///< pool we are migrating from
+  std::optional<int64_t> migration_target; ///< pool we are migrating to
+  std::set<pg_t> migrating_pgs; ///< PGs currently migrating. Any higher value PGs have completed migration
+
+  void clear_migrating_pgs() { migrating_pgs.clear(); }
+
+  bool is_migrating() const { return migration_src.has_value() || migration_target.has_value(); }
+  bool is_migration_src() const { return migration_target.has_value(); }
+  bool is_migration_target() const { return migration_src.has_value(); }
+  bool is_pg_migrating(pg_t pgid) const { return migrating_pgs.contains(pgid); }
+  bool has_pg_migrated(pg_t pgid) const {
+    return is_migration_src() &&
+      (pgid.ps() >= lowest_migrated_pg) &&
+      !is_pg_migrating(pgid);
+  }
   pool_opts_t opts; ///< options
 
   typedef enum {
@@ -3583,6 +3604,8 @@ public:
     int32_t new_crush_member,
     bool old_allow_ec_optimizations,
     bool new_allow_ec_optimizations,
+    const std::set<pg_t> old_migrating_pgs,
+    const std::set<pg_t> new_migrating_pgs,
     pg_t pgid
     );
 

@@ -301,7 +301,6 @@ protected:
     setup_up_acting();
   }
 
-#if POOL_MIGRATION
   // Create a 2nd pool as an EC pool and set up migration from the old pool
   void migrate_to_ec_pool(int k = 2, int m = 2, bool fast_ec = true)
   {
@@ -320,12 +319,21 @@ protected:
     spi->migrating_pgs.emplace(pg_t(0, old_pool_id));
     spi->lowest_migrated_pg = 1;
     apply_incremental(pending_inc);
+    setup_up_acting();
+  }
+
+  // Create a 2nd pool as an EC pool and set up migration from the old pool
+  // Test cases run on the source pool
+  void migrate_to_ec_pool_source(int k = 2, int m = 2, bool fast_ec = true)
+  {
+    uint64_t old_pool_id = pool_id;
+    int old_pool_size = pool_size;
+    migrate_to_ec_pool_target(k, m, fast_ec);
     // Reset to the source pool
     pool_id = old_pool_id;
     pool_size = old_pool_size;
     setup_up_acting();
   }
-#endif
 
   // Helper to swap an OSD in the up and acting set
   void modify_up_acting(int offset, int osd)
@@ -881,8 +889,7 @@ protected:
     get_ps(acting_primary)->handle_event(evt, get_ctx(acting_primary));
   }
 
-#if POOL_MIGRATION
-// Helper - migration done
+  // Helper - migration done
   void test_event_migration_done()
   {
     dout(0) << "= test_event_migration_done =" << dendl;
@@ -893,7 +900,6 @@ protected:
 
     get_ps(acting_primary)->handle_event(evt, get_ctx(acting_primary));
   }
-#endif
 
   // Helper - run peering cycle with new epochs if required for upthru or pgtemp
   void test_peering()
@@ -924,9 +930,7 @@ protected:
     EXPECT_TRUE(ps->is_clean());
     EXPECT_FALSE(ps->is_recovering());
     EXPECT_FALSE(ps->is_backfilling());
-#if POOL_MIGRATION
     EXPECT_FALSE(ps->is_migrating());
-#endif
   }
 
   // Helper - verify primary OSD is in active+recovering state
@@ -938,9 +942,7 @@ protected:
     EXPECT_FALSE(ps->is_clean());
     EXPECT_TRUE(ps->is_recovering());
     EXPECT_FALSE(ps->is_backfilling());
-#if POOL_MIGRATION
     EXPECT_FALSE(ps->is_migrating());
-#endif
   }
 
   // Helper - verify primary OSD is in active+backfilling state
@@ -952,9 +954,7 @@ protected:
     EXPECT_FALSE(ps->is_clean());
     EXPECT_FALSE(ps->is_recovering());
     EXPECT_TRUE(ps->is_backfilling());
-#if POOL_MIGRATION
     EXPECT_FALSE(ps->is_migrating());
-#endif
   }
 
   // Helper - verify primary OSD is in active+migrating state
@@ -966,9 +966,7 @@ protected:
     EXPECT_FALSE(ps->is_clean());
     EXPECT_FALSE(ps->is_recovering());
     EXPECT_FALSE(ps->is_backfilling());
-#if POOL_MIGRATION
     EXPECT_TRUE(ps->is_migrating());
-#endif
   }
 
   // Helper - verify replica OSD is activated
@@ -1150,7 +1148,6 @@ protected:
     verify_logs();
   }
 
-#if POOL_MIGRATION
   // Helper - verify all OSDs in active+migrating state with log checks
   void verify_all_active_migrating(const eversion_t& expected_update = eversion_t(),
                                 const eversion_t& expected_tail = eversion_t())
@@ -1170,7 +1167,6 @@ protected:
     }
     verify_logs();
   }
-#endif
 
   // Helper - verify PWLC state
   void verify_pwlc(epoch_t e,  std::map<shard_id_t,std::pair<eversion_t, eversion_t>> pwlc, int toosd = -1)
@@ -1826,7 +1822,6 @@ TEST_F(PeeringStateTest, Backfill) {
   verify_all_active_clean(expected, expected_tail);
 }
 
-#if POOL_MIGRATION
 // Multi-OSD test of peering with pool migration all the way to active+clean
 TEST_F(PeeringStateTest, PoolMigration) {
   dout(0) << "== PoolMigration ==" << dendl;
@@ -1846,9 +1841,7 @@ TEST_F(PeeringStateTest, PoolMigration) {
   verify_all_active_clean(eversion_t(), eversion_t());
   EXPECT_TRUE(get_listener(acting[0])->pg_migrated_pool_sent);
 }
-#endif
 
-#if POOL_MIGRATION
 // Multi-OSD test of peering with pool migration too full
 TEST_F(PeeringStateTest, PoolMigrationTooFull) {
   dout(0) << "== PoolMigration ==" << dendl;
@@ -1895,9 +1888,7 @@ TEST_F(PeeringStateTest, PoolMigrationTooFull) {
   verify_all_active_clean(eversion_t(), eversion_t());
   EXPECT_TRUE(get_listener(acting[0])->pg_migrated_pool_sent);
 }
-#endif
 
-#if POOL_MIGRATION
 // Multi-OSD test of peering with pool migration reservtion preempt
 TEST_F(PeeringStateTest, PoolMigrationPrempt) {
   dout(0) << "== PoolMigration ==" << dendl;
@@ -2016,7 +2007,6 @@ TEST_F(PeeringStateTest, PoolMigrationPrempt) {
   verify_all_active_clean(eversion_t(), eversion_t());
   EXPECT_TRUE(get_listener(acting[0])->pg_migrated_pool_sent);
 }
-#endif
 
 // Test that BackfillTooFull event won't crash the OSD when received
 // in RepNotRecovering state.

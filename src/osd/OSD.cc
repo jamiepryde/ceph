@@ -2081,6 +2081,18 @@ void OSDService::prune_sent_ready_to_merge(const OSDMapRef& osdmap)
 
 // ---
 
+void OSDService::send_pg_migrated_pool(std::optional<int64_t> migration_target, pg_t pgid)
+{
+  dout(20) << __func__
+	   << " send_pg_migrated_pool " << pgid << dendl;
+  ceph_assert(migration_target.has_value());
+  monc->send_mon_message(new MOSDPGMigratedPool(osdmap->get_epoch(),
+						*migration_target,
+						pgid));
+}
+
+// ---
+
 void OSDService::_queue_for_recovery(
   pg_awaiting_throttle_t p,
   uint64_t reserved_pushes)
