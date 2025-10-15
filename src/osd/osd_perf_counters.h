@@ -266,6 +266,9 @@ enum {
   rs_pg_rebuild_duration,
   rs_pg_rebuild_max_secs,
   rs_pg_rebuild_min_secs,
+  rs_stats_invalidated,
+  rs_waitlocalpoolmigrationreserved_latency,
+  rs_waitremotepoolmigrationreserved_latency,
   rs_last,
 };
 
