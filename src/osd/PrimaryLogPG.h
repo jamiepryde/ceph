@@ -1196,6 +1196,13 @@ protected:
   hobject_t last_backfill_started;
   bool new_backfill;
 
+  /// last pool migration operation started
+  hobject_t last_pool_migration_started;
+  /// set for 1st object migration after activate
+  bool new_pool_migration_interval;
+  /// set while migrating 1st object after activate
+  bool new_pool_migration_interval_in_flight;
+
   int prep_object_replica_pushes(const hobject_t& soid, eversion_t v,
 				 PGBackend::RecoveryHandle *h,
 				 bool *work_started);
@@ -1357,10 +1364,20 @@ protected:
     const std::set<pg_shard_t> &backfill_targets
     );
 
+  void scan_range_migration(
+    int min, int max, PoolMigrationInterval *pmi,
+    HBHandle *handle
+    );
+
   /// Update a hash range to reflect changes since the last scan
   void update_range(
     PrimaryBackfillInterval *bi, ///< [in,out] interval to update
     ThreadPool::TPHandle &handle ///< [in] tp handle
+    );
+
+  void update_range(
+    PoolMigrationInterval *pmi,
+    HBHandle *handle
     );
 
   int prep_backfill_object_push(
@@ -1378,6 +1395,29 @@ protected:
   void _applied_recovered_object_replica();
   void _committed_pushed_object(epoch_t epoch, eversion_t lc);
   void recover_got(hobject_t oid, eversion_t v);
+
+  /**
+   * Schedule pool migration work
+   * @param work_started will be std::set to true if recover_migration got anywhere
+   * @returns the number of operations started
+   */
+  uint64_t recover_pool_migration(uint64_t max, ThreadPool::TPHandle &handle,
+			          bool *work_started);
+  pg_t get_source_pg_from_hash(const hobject_t &hobj);
+  pg_t get_target_pg_from_hash(const hobject_t &hobj);
+  uint16_t count_remaining_target_pgs(const hobject_t &hobj);
+  void pool_migration_request_target_reservation() override;
+  void pool_migration_release_target_reservation();
+
+  void start_target_pool_migration(int64_t num_bytes, int64_t num_objects);
+  void stop_target_pool_migration();
+  void stop_pool_migration_unfound();
+  void stop_pool_migration_toofull();
+  void stop_pool_migration_revoked();
+  void stop_pool_migration_error(int error_code);
+  void on_pool_migration_source_suspended() override;
+  void on_pool_migration_target_reserved() override;
+  void on_pool_migration_target_suspended(bool toofull) override;
 
   // -- copyfrom --
   std::map<hobject_t, CopyOpRef> copy_ops;
@@ -1971,7 +2011,9 @@ public:
   void plpg_on_pool_change() override;
   void clear_async_reads();
   void on_change(ObjectStore::Transaction &t) override;
-  void on_activate_complete() override;
+  void _on_activate_committed(HBHandle *handle);
+  void on_activate_committed(HBHandle *handle) override;
+  void on_activate_complete(HBHandle *handle) override;
   void on_flushed() override;
   void on_removal(ObjectStore::Transaction &t) override;
   void on_shutdown() override;
