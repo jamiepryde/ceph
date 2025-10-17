@@ -726,8 +726,76 @@ public:
     return std::string();
   }
 
-  std::ostream &cout_prefix() {
-    return std::cout << timestamp_string();
+  bool is_pool_migration_in_progress() {
+    std::string outstr;
+    bufferlist outbl;
+
+    if (rados.mon_command( R"({"prefix": "status"})", {}, &outbl, &outstr) != 0) {
+      std::cerr << "Error: could not get ceph status: " << outstr << std::endl;
+      ceph_abort();
+    }
+
+    return (outbl.to_str().contains("Pool migration"));
+  }
+
+  int start_pool_migration(const std::string &source_name, const int pg_num,
+                           bool enable_ec_optimizations) {
+    auto const formatter = std::make_shared<JSONFormatter>(false);
+    std::ostringstream oss;
+    messaging::osd::OSDPoolMigrateRequest pool_mig_request{source_name, pg_num,
+      enable_ec_optimizations, true};
+    encode_json("OSDPoolMigrateRequest", pool_mig_request, formatter.get());
+    formatter.get()->flush(oss);
+
+    std::string outstr;
+    int r = rados.mon_command(oss.str(), {}, nullptr, &outstr);
+    if (r == -EBUSY) {
+      cout_prefix() << __func__ << " migration not started yet (pg_num unstable), "
+                    << "will retry: " << outstr << std::endl;
+      return r;
+    }
+    if (r != 0) {
+      std::cerr << "Error: could not start pool migration: " << outstr << std::endl;
+      ceph_abort();
+    }
+    return 0;
+  }
+
+  void manage_pool_migrations() {
+    int migration_counter = 0;
+    int initial_pg_num = get_pool_pg_num(pool_name);
+    int pg_num = initial_pg_num;
+    bool needs_wait = false;
+
+    if (initial_migration_delay > 0) {
+      cout_prefix() << __func__ << " delaying for " << std::to_string(initial_migration_delay)
+                    << " before starting initial pool migration" << std::endl;
+      std::this_thread::sleep_for(std::chrono::seconds(initial_migration_delay));
+    }
+
+    while (!finished) {
+      int sleep_duration = 60;
+      if (is_pool_migration_in_progress()) {
+        cout_prefix() << __func__ << " migration in progress" << std::endl;
+      } else if (!needs_wait) {
+        pg_num = migration_pg_num.has_value() && pg_num != migration_pg_num.value() ?
+          migration_pg_num.value() : initial_pg_num;
+        cout_prefix() << __func__ << " starting new pool migration on "
+                      << pool_name << std::endl;
+        if (start_pool_migration(pool_name, pg_num, migration_ec_opts) == -EBUSY) {
+          // not started yet; leave needs_wait unset to retry next iteration
+        } else {
+          needs_wait = true;
+        }
+      } else {
+        sleep_duration = migration_interval;
+        migration_counter++;
+        needs_wait = false;
+        cout_prefix() << __func__ << ": migration completed, sleeping for "
+              << std::to_string(sleep_duration) << " seconds" << std::endl;
+      }
+      std::this_thread::sleep_for(std::chrono::seconds(sleep_duration));
+    }
   }
 };
 
