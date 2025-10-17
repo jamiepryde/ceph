@@ -300,6 +300,10 @@ public:
     return peering_state.get_info();
   }
 
+  const auto& get_pgpool() const {
+    return peering_state.get_pgpool();
+  }
+
   // DoutPrefixProvider
   std::ostream& gen_prefix(std::ostream& out) const final {
     return out << *this;
@@ -809,9 +813,6 @@ public:
     return get_info().history.same_interval_since;
   }
 
-  const auto& get_pgpool() const {
-    return peering_state.get_pgpool();
-  }
   pg_shard_t get_primary() const {
     return peering_state.get_primary();
   }

@@ -92,6 +92,7 @@
 #include "messages/MOSDBoot.h"
 #include "messages/MOSDPGTemp.h"
 #include "messages/MOSDPGReadyToMerge.h"
+#include "messages/MOSDPGMigratedPool.h"
 
 #include "messages/MOSDMap.h"
 #include "messages/MMonGetOSDMap.h"

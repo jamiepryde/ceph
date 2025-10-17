@@ -6199,6 +6199,63 @@ void PeeringState::NotRecovering::exit()
   pl->get_peering_perf().tinc(rs_notrecovering_latency, dur);
 }
 
+/*--WaitRemotePoolMigrationReserved--*/
+PeeringState::WaitRemotePoolMigrationReserved::WaitRemotePoolMigrationReserved(my_context ctx)
+  : my_base(ctx),
+    NamedState(context< PeeringMachine >().state_history, "Started/Primary/Active/WaitRemotePoolMigrationReserved")
+{
+  context< PeeringMachine >().log_enter(state_name);
+  DECLARE_LOCALS;
+
+  ps->state_set(PG_STATE_MIGRATION_WAIT);
+  pl->publish_stats_to_osd();
+
+  // FIXME: Stub - release local reservations and send migration done message
+  pl->cancel_local_background_io_reservation();
+  ps->state_clear(PG_STATE_MIGRATION_WAIT);
+  pl->send_pg_migrated_pool();
+  post_event(AllPoolMigrationsReserved());
+}
+
+void PeeringState::WaitRemotePoolMigrationReserved::exit()
+{
+  context< PeeringMachine >().log_exit(state_name, enter_time);
+  DECLARE_LOCALS;
+
+  utime_t dur = ceph_clock_now() - enter_time;
+  pl->get_peering_perf().tinc(rs_waitremotepoolmigrationreserved_latency, dur);
+}
+
+/*--WaitLocalPoolMigrationReserved--*/
+PeeringState::WaitLocalPoolMigrationReserved::WaitLocalPoolMigrationReserved(my_context ctx)
+  : my_base(ctx),
+    NamedState(context< PeeringMachine >().state_history, "Started/Primary/Active/WaitLocalPoolMigrationReserved")
+{
+  context< PeeringMachine >().log_enter(state_name);
+  DECLARE_LOCALS;
+
+  ps->state_set(PG_STATE_MIGRATION_WAIT);
+  pl->request_local_background_io_reservation(
+    ps->get_pool_migration_priority(),
+    std::make_unique<PGPeeringEvent>(
+      ps->get_osdmap_epoch(),
+      ps->get_osdmap_epoch(),
+      LocalPoolMigrationReserved()),
+    std::make_unique<PGPeeringEvent>(
+      ps->get_osdmap_epoch(),
+      ps->get_osdmap_epoch(),
+      DeferPoolMigration(0.0)));
+  pl->publish_stats_to_osd();
+}
+
+void PeeringState::WaitLocalPoolMigrationReserved::exit()
+{
+  context< PeeringMachine >().log_exit(state_name, enter_time);
+  DECLARE_LOCALS;
+  utime_t dur = ceph_clock_now() - enter_time;
+  pl->get_peering_perf().tinc(rs_waitlocalpoolmigrationreserved_latency, dur);
+}
+
 /*---RepNotRecovering----*/
 PeeringState::RepNotRecovering::RepNotRecovering(my_context ctx)
   : my_base(ctx),
