@@ -2350,7 +2350,6 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op)
 	   << " flags " << ceph_osd_flag_string(m->get_flags())
 	   << dendl;
 
-
   // missing object?
   if (is_unreadable_object(head)) {
     if (!is_primary() && is_missing_any_head_or_clone_of(head)) {

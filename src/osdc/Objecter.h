@@ -1848,7 +1848,11 @@ private:
       it++;
     }
   }
-
+  // Cache of pool migration watermarks for each placement group. Cleared on
+  // each epoch and updated by the OSD providing the current watermark when
+  // redirecting a request to the target pool. Use rwlock for thread safety
+  // when accessing.
+  std::map<pg_t, hobject_t> pool_migration_watermarks;
 public:
   void maybe_request_map();
 
@@ -2285,6 +2289,25 @@ public:
     std::string nspace;
 
     ceph::buffer::list bl;   // raw data read to here
+
+    // Pool Migration specific attributes
+  	std::list<librados::ListObjectImpl> tgt_list;
+  	std::list<librados::ListObjectImpl> src_list;
+  	std::list<librados::ListObjectImpl> intermediate_list;
+
+  	collection_list_handle_t end_of_tgt;
+
+	uint64_t src_pool_id = -1;
+	uint64_t tgt_pool_id = -1;
+
+  	collection_list_handle_t src_pos;
+  	collection_list_handle_t tgt_pos;
+
+  	enum stage {TGT_READ, SRC_READ, TGT_SECOND_READ};
+  	stage current_stage = TGT_READ;
+  	bool end_of_tripple_read = false;
+  	// End of Pool Migration attributes
+
     std::list<librados::ListObjectImpl> list;
 
     ceph::buffer::list filter;
@@ -2652,12 +2675,13 @@ public:
     Op *op);
 
   bool target_should_be_paused(op_target_t *op);
-  int _calc_target(op_target_t *t, bool any_change = false);
-  int _map_session(op_target_t *op, OSDSession **s,
+  int _calc_target(op_target_t *t, snapid_t snap, bool any_change = false);
+  int _map_session(op_target_t *op, snapid_t snap, OSDSession **s,
 		   ceph::shunique_lock<ceph::shared_mutex>& lc);
 
   void _session_op_assign(OSDSession *s, Op *op);
   void _session_op_remove(OSDSession *s, Op *op);
+  void _session_op_remove(OSDSession *s, std::map<ceph_tid_t,Op*>::iterator& it);
   void _session_linger_op_assign(OSDSession *to, LingerOp *op);
   void _session_linger_op_remove(OSDSession *from, LingerOp *op);
   void _session_command_op_assign(OSDSession *to, CommandOp *op);
@@ -2722,6 +2746,10 @@ private:
 
   void _nlist_reply(NListContext *list_context, int r, Context *final_finish,
 		   epoch_t reply_epoch);
+
+  void combine_result_lists(NListContext *list_context);
+
+  static uint32_t reverse_bits_32(uint32_t n);
 
   void resend_mon_ops();
 
