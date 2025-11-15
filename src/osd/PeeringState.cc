@@ -262,11 +262,6 @@ hobject_t PeeringState::earliest_backfill() const
   return e;
 }
 
-hobject_t PeeringState::earliest_pool_migration() const
-{
-  return hobject_t(); //BILL:FIXME: need to track progress of pool migration
-}
-
 void PeeringState::purge_strays()
 {
   if (is_premerge()) {
@@ -1655,7 +1650,7 @@ bool PeeringState::needs_pool_migration() const
 {
   ceph_assert(is_primary());
 
-  bool migrating = pool.info.migrating_pgs.contains(spgid.pgid);
+  bool migrating = pool.info.is_pg_migrating(spgid.pgid);
   if (migrating) {
     psdout(10) << "needs pool migration" << dendl;
   } else {
@@ -6666,6 +6661,8 @@ PeeringState::WaitLocalPoolMigrationReserved::WaitLocalPoolMigrationReserved(my_
 {
   context< PeeringMachine >().log_enter(state_name);
   DECLARE_LOCALS;
+
+  pl->on_pool_migration_source_starting();
 
   // If first attempt at acquiring reservation set WAIT,
   // if retrying then retain either TOOFULL or WAIT from

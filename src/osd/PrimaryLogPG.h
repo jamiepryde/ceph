@@ -1196,6 +1196,10 @@ protected:
   hobject_t last_backfill_started;
   bool new_backfill;
 
+  /// current watermark tracking pool migration progress
+  hobject_t pool_migration_watermark;
+  /// currently migrating objects
+  std::set<hobject_t> pool_migrations_in_flight;
   /// last pool migration operation started
   hobject_t last_pool_migration_started;
   /// set for 1st object migration after activate
@@ -1230,6 +1234,13 @@ protected:
   {
     return next_pool_migration(std::nullopt);
   }
+  void update_migration_watermark(const hobject_t &watermark) override
+  {
+    pool_migration_watermark = watermark;
+  }
+  std::optional<hobject_t> consider_updating_migration_watermark(std::set<hobject_t> &deleted) override;
+
+  hobject_t earliest_pool_migration();
   void update_migration_watermark(const hobject_t &watermark) override
   {
     pool_migration_watermark = watermark;
@@ -1399,7 +1410,8 @@ protected:
 
   void scan_range_migration(
     int min, int max, PoolMigrationInterval *pmi,
-    HBHandle *handle
+    HBHandle *handle,
+    hobject_t start
     );
 
   /// Update a hash range to reflect changes since the last scan
@@ -1449,6 +1461,7 @@ protected:
   void stop_pool_migration_toofull();
   void stop_pool_migration_revoked();
   void stop_pool_migration_error(int error_code);
+  void on_pool_migration_source_starting() override;
   void on_pool_migration_source_suspended() override;
   void on_pool_migration_target_reserved() override;
   void on_pool_migration_target_suspended(bool toofull) override;
