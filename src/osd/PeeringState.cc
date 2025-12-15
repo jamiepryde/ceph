@@ -7531,6 +7531,7 @@ boost::statechart::result PeeringState::Active::react(const AllReplicasActivated
 
   DECLARE_LOCALS;
   pg_t pgid = context< PeeringMachine >().spgid.pgid;
+  auto &rctx = context<PeeringMachine>().get_recovery_ctx();
 
   all_replicas_activated = true;
 
@@ -7585,7 +7586,7 @@ boost::statechart::result PeeringState::Active::react(const AllReplicasActivated
   ps->share_pg_info();
   pl->publish_stats_to_osd();
 
-  pl->on_activate_complete();
+  pl->on_activate_complete(rctx.handle);
 
   return discard_event();
 }
@@ -7749,7 +7750,7 @@ boost::statechart::result PeeringState::ReplicaActive::react(
   if (ps->info.stats.state != ps->state) {
     ps->info.stats.state = ps->state;
   }
-  pl->on_activate_committed();
+  pl->on_activate_committed(rctx.handle);
 
   return discard_event();
 }
