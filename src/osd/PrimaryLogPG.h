@@ -1199,6 +1199,34 @@ protected:
   /// set while migrating 1st object after activate
   bool new_pool_migration_interval_in_flight;
 
+  // set when we get GRANT from all target PGs and can start copy_from
+  bool pool_migration_reservations_granted = false;
+  // waiting for GRANT from target PGs
+  bool pool_migration_waiting_for_reservations = false;
+  // copy_from failed, waiting for inflight migrations and deletes to complete
+  bool pool_migration_quiescing = false;
+  // is this needed? how many retries do we want before quiescing?
+  uint32_t pool_migration_failure_count = 0;
+  bool pool_migration_needs_deletion = false;
+  hobject_t pool_migration_deletion_start_obj;
+  hobject_t pool_migration_deletion_current;
+
+  // SOURCE-side: Track pending TAKE message responses
+   struct PendingReservationRequest {
+     ceph_tid_t tid;
+     pg_t target_pg;
+     int64_t num_bytes;
+     int64_t num_objects;
+   };
+  std::map<ceph_tid_t, PendingReservationRequest> pending_reservation_requests;
+  int pending_reservation_count = 0;
+
+  // // TARGET-side: Flag indicating we have active reservations for incoming copy_from
+  // bool pool_migration_target_has_reservations = false;
+  // // TARGET-side: Store pending TAKE op to complete when reservation GRANTED
+  OpRequestRef pending_pool_migration_take_op;
+  std::vector<OSDOp> pending_pool_migration_take_ops;
+
   hobject_t next_pool_migration(std::optional<hobject_t> start);
   hobject_t earliest_pool_migration()
   {
@@ -1410,14 +1438,17 @@ protected:
    */
   uint64_t recover_pool_migration(uint64_t max, ThreadPool::TPHandle &handle,
 			          bool *work_started);
-
   void start_target_pool_migration(int64_t num_bytes, int64_t num_objects);
   void stop_target_pool_migration();
   void stop_pool_migration_unfound();
   void stop_pool_migration_toofull();
   void stop_pool_migration_revoked();
+  void on_pool_migration_source_reserved() override;
+  void send_pool_migration_take_to_target() override;
   void on_pool_migration_target_reserved() override;
   void on_pool_migration_target_suspended(bool toofull) override;
+  void on_pool_migration_reservation_revoked();
+  uint64_t recover_pool_migration_deletion(uint64_t max);
 
   // -- copyfrom --
   std::map<hobject_t, CopyOpRef> copy_ops;
@@ -1586,6 +1617,7 @@ protected:
   friend struct C_SetManifestRefCountDone;
   friend struct SetManifestFinisher;
   friend struct C_Migrate;
+  friend struct C_ReserveTake;
 
 public:
   PrimaryLogPG(OSDService *o, OSDMapRef curmap,

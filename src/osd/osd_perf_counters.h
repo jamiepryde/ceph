@@ -258,6 +258,7 @@ enum {
   rs_notmigrating_latency,
   rs_repwaitmigrationreserved_latency,
   rs_migratingsource_latency,
+
   rs_last,
 };
 

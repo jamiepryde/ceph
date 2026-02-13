@@ -6018,6 +6018,7 @@ boost::statechart::result
 PeeringState::MigratingSource::react(const PoolMigrationDone &c)
 {
   DECLARE_LOCALS;
+  ps->state_clear(PG_STATE_MIGRATING);
   migration_release_reservations();
   // Notify monitor that PG has completed migration
   pl->send_pg_migrated_pool();
@@ -6246,7 +6247,9 @@ void PeeringState::WaitRemotePoolMigrationReserved::migration_release_reservatio
   set<pg_shard_t>::const_iterator it, begin, end;
   begin = context< Active >().remote_shards_to_reserve_migration.begin();
   end = context< Active >().remote_shards_to_reserve_migration.end();
+
   ceph_assert(begin != end);
+
   for (it = begin; it != migration_osd_it; ++it) {
     if (*it == ps->pg_whoami) {
       pl->unreserve_recovery_space();
@@ -6361,6 +6364,7 @@ PeeringState::WaitLocalPoolMigrationReserved::WaitLocalPoolMigrationReserved(my_
       ps->get_osdmap_epoch(),
       ps->get_osdmap_epoch(),
       DeferPoolMigration(0.0)));
+  pl->send_pool_migration_take_to_target();
   pl->publish_stats_to_osd();
 }
 

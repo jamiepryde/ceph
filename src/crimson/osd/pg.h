@@ -464,6 +464,10 @@ public:
   void on_pool_migration_target_suspended(bool toofull) final {
     recovery_handler->on_pool_migration_target_suspended(toofull);
   }
+  void send_pool_migration_take_to_target() final {
+    // Crimson stub - not implemented yet
+    ceph_abort("send_pool_migration_take_to_target not implemented in crimson");
+  }
 
   void on_recovery_cancelled() final {
     cancel_pglog_based_recovery_op();

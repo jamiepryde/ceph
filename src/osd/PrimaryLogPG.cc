@@ -1630,8 +1630,55 @@ void PrimaryLogPG::do_pg_op(OpRequestRef op)
       }
       break;
 
-   case CEPH_OSD_OP_SCRUBLS:
-      result = do_scrub_ls(m, &osd_op);
+    case CEPH_OSD_OP_SCRUBLS:
+      {
+        result = do_scrub_ls(m, &osd_op);
+      }
+      break;
+
+    case CEPH_OSD_OP_PG_POOLMIG_RESERVE_TAKE:
+      {
+        dout(20) << __func__ << " CEPH_OSD_OP_PG_POOLMIG_RESERVE_TAKE" << dendl;
+        hobject_t start_obj;
+        uint32_t priority = p->op.pool_mig_reserve.priority;
+        int64_t source_num_bytes = p->op.pool_mig_reserve.num_bytes;
+        int64_t source_num_objects = p->op.pool_mig_reserve.num_objects;
+
+        try {
+          decode(start_obj, bp);
+        }
+        catch (const ceph::buffer::error& e) {
+          dout(0) << "unable to decode PG_POOLMIG_RESERVE_TAKE start_obj in " << *m << dendl;
+          result = -EINVAL;
+          break;
+        }
+
+        dout(20) << __func__ << " TAKE start_obj=" << start_obj
+                 << " priority=" << priority
+                 << " num_bytes=" << source_num_bytes
+                 << " num_objects=" << source_num_objects << dendl;
+
+        // Store the op until we get a response from the target PG
+        pending_pool_migration_take_op = op;
+        pending_pool_migration_take_ops = m->ops;
+
+        start_target_pool_migration(source_num_bytes, source_num_objects);
+
+        // Return here so that we don't immediately send a MOSDOp reply!
+        return;
+      }
+      break;
+
+    case CEPH_OSD_OP_PG_POOLMIG_RESERVE_RELEASE:
+      {
+        dout(20) << __func__ << " CEPH_OSD_OP_PG_POOLMIG_RESERVE_RELEASE" << dendl;
+
+        stop_target_pool_migration();
+
+        result = 0;
+        pg_poolmig_response_t response(0);
+        encode(response, osd_op.outdata);
+      }
       break;
 
     default:
@@ -1796,6 +1843,10 @@ PrimaryLogPG::PrimaryLogPG(OSDService *o, OSDMapRef curmap,
   new_backfill(false),
   new_pool_migration_interval(false),
   new_pool_migration_interval_in_flight(false),
+  pool_migration_reservations_granted(false),
+  pool_migration_waiting_for_reservations(false),
+  pool_migration_quiescing(false),
+  pool_migration_failure_count(0),
   temp_seq(0),
   snap_trimmer_machine(this)
 {
@@ -13205,7 +13256,12 @@ void PrimaryLogPG::_on_activate_committed(HBHandle *handle)
   }
 
   pool_migrations_in_flight.clear();
+  pool_migration_reservations_granted = false;
+  //pool_migration_waiting_for_reservations = false;
+  pool_migration_quiescing = false;
+  pool_migration_failure_count = 0;
   new_pool_migration_interval_in_flight = false;
+
   if (pool.info.is_pg_migrating(info.pgid.pgid)) {
     pool_migration_info.reset(hobject_t());
     scan_range_migration(
@@ -13329,6 +13385,18 @@ void PrimaryLogPG::on_change(ObjectStore::Transaction &t)
   cancel_manifest_ops(is_primary(), &tids);
   cancel_cls_gather_ops(is_primary(), &tids);
   osd->objecter->op_cancel(tids, -ECANCELED);
+
+  // Cancel any pending reservation requests (SOURCE side)
+  //pending_reservation_requests.clear();
+  //pending_reservation_count = 0;
+
+  // Cancel any pending TAKE operation (TARGET side)
+  //if (pending_pool_migration_take_op) {
+  //  MOSDOp *m = static_cast<MOSDOp*>(pending_pool_migration_take_op->get_nonconst_req());
+  //  osd->reply_op_error(pending_pool_migration_take_op, -EAGAIN);
+  //  pending_pool_migration_take_op.reset();
+  //  pending_pool_migration_take_ops.clear();
+  //}
 
   // requeue object waiters
   for (auto& p : waiting_for_unreadable_object) {
@@ -13588,10 +13656,14 @@ bool PrimaryLogPG::start_recovery_ops(
     }
   }
 
-
+  dout(10) << "JP before state_test" << dendl;
+  //if (state_test(PG_STATE_MIGRATING) || state_test(PG_STATE_MIGRATION_WAIT) || pool.info.migration_target) {
+  //if (state_test(PG_STATE_MIGRATING) || state_test(PG_STATE_MIGRATION_WAIT)) {
   if (state_test(PG_STATE_MIGRATING)) {
+      dout(10) << "JP in state_test" << dendl;
       started += recover_pool_migration(max - started, handle, &work_in_progress);
   }
+  dout(10) << "JP after state_test" << dendl;
 
   dout(10) << " started " << started << dendl;
   osd->logger->inc(l_osd_rop, started);
@@ -13681,7 +13753,6 @@ bool PrimaryLogPG::start_recovery_ops(
             PeeringState::Backfilled())));
     }
   } else { // migrating
-    state_clear(PG_STATE_MIGRATING);
     dout(10) << "migration done" << dendl;
     queue_peering_event(
       PGPeeringEventRef(
@@ -14934,6 +15005,98 @@ struct C_Migrate : public Context {
   }
 };
 
+struct C_ReserveTake : public Context {
+  PrimaryLogPGRef pg;
+  epoch_t last_peering_reset;
+  ceph_tid_t tid;
+  ceph::buffer::list outbl;
+
+  C_ReserveTake(PrimaryLogPG *p, epoch_t lpr)
+    : pg(p), last_peering_reset(lpr), tid(0)
+  {}
+
+  void finish(int r) override {
+    ldpp_dout(pg, 20) << "C_ReserveTake::finish() called: tid=" << tid
+                    << " r=" << r
+                    << " outbl.length()=" << outbl.length() << dendl;
+    if (r == -ECANCELED) {
+      ldpp_dout(pg, 10) << "C_ReserveTake::finish() ECANCELED, returning" << dendl;
+      return;
+    }
+    std::scoped_lock l(*pg);
+    ldpp_dout(pg, 10) << "C_ReserveTake::finish() acquired lock, last_peering_reset="
+                    << last_peering_reset
+                    << " pg->get_last_peering_reset()=" << pg->get_last_peering_reset() << dendl;
+    if (last_peering_reset != pg->get_last_peering_reset()) {
+      ldpp_dout(pg, 10) << "C_ReserveTake::finish() peering reset mismatch, returning" << dendl;
+      return;
+    }
+
+    ldpp_dout(pg, 10) << "C_ReserveTake::finish() pool_migration_waiting_for_reservations="
+                        << pg->pool_migration_waiting_for_reservations << dendl;
+
+    if (!pg->pool_migration_waiting_for_reservations) {
+      ldpp_dout(pg, 10) << "C_ReserveTake::finish() not waiting for reservations, returning" << dendl;
+      // Already processed or no longer waiting
+      return;
+    }
+
+    // Find and remove this request
+    auto it = pg->pending_reservation_requests.find(tid);
+    if (it == pg->pending_reservation_requests.end()) {
+      ldpp_dout(pg, 1) << "C_ReserveTake::finish() ERROR: tid=" << tid
+                 << " not found in pending_reservation_requests!" << dendl;
+      return;
+    }
+
+    ldpp_dout(pg, 10) << "C_ReserveTake::finish() found tid=" << tid
+                  << " in pending requests, target_pg=" << it->second.target_pg << dendl;
+
+    pg->pending_reservation_requests.erase(it);
+    pg->pending_reservation_count--;
+
+    ldpp_dout(pg, 10) << "C_ReserveTake::finish() pending_reservation_count now="
+                  << pg->pending_reservation_count << dendl;
+
+    pg_poolmig_response_t response;
+    if (r == 0 && outbl.length() > 0) {
+      try {
+        auto p = outbl.cbegin();
+        decode(response, p);
+        r = response.result;
+      } catch (const ceph::buffer::error& e) {
+        r = -EINVAL;
+      }
+    }
+
+    if (r != 0) {
+      ldpp_dout(pg, 1) << "C_ReserveTake::finish() ERROR: reservation failed with r=" << r << dendl;
+      // Cancel all other pending requests
+      pg->pending_reservation_requests.clear();
+      pg->pending_reservation_count = 0;
+      pg->pool_migration_waiting_for_reservations = false;
+
+      if (r == -ENOSPC) {
+        pg->stop_pool_migration_toofull();
+      } else {
+        pg->stop_pool_migration_revoked();
+      }
+      return;
+    }
+
+    ldpp_dout(pg, 10) << "C_ReserveTake::finish() reservation successful, pending_reservation_count="
+                  << pg->pending_reservation_count << dendl;
+
+    if (pg->pending_reservation_count == 0) {
+      ldpp_dout(pg, 10) << "C_ReserveTake::finish() ALL reservations granted! Calling on_pool_migration_source_reserved()" << dendl;
+      // All target PGs have granted reservations
+      //pg->pool_migration_waiting_for_reservations = false;
+      pg->pool_migration_reservations_granted = true;
+      pg->PG::on_pool_migration_source_reserved();
+    }
+  }
+};
+
 void PrimaryLogPG::pool_migration_delete(hobject_t oid)
 {
     ObjectContextRef obc = get_object_context(oid, false);
@@ -14984,6 +15147,32 @@ uint64_t PrimaryLogPG::recover_pool_migration(
 	   << (new_pool_migration_interval ? " new_pool_migration_interval":"")
 	   << dendl;
 
+  if (!pool_migration_reservations_granted) {
+    dout(20) << __func__ << " trying to migrate before reservations granted!" << dendl;
+    return 0; // TODO - correct return value?
+  }
+  // Can't send reservations here because we only enter this function if PGs are already in MIGRATING state!
+  //if ((!pool_migration_waiting_for_reservations || !pool_migration_reservations_granted) && pool.info.migration_target) {
+  //   dout(20) << "JP send_pool_migration_take_to_target()" << dendl;
+  //   send_pool_migration_take_to_target();
+  //   pool_migration_waiting_for_reservations = true;
+  //   return 0;
+  // }
+
+  // TODO - sort out deletes as part of reservations
+
+  // TODO
+  // if (pool_migration_quiescing) {
+  //   if (pool_migrations_in_flight.empty() && pool_migration_pending_deletes.empty()) {
+  //     dout(20) << __func__ << " pool_migration_quiescing" << dendl;
+  //     pool_migration_quiescing = false;
+  //     pool_migration_waiting_for_reservations = true;
+  //     pool_migration_failure_count = 0;
+  //   }
+  //   *work_started = true;
+  //   return 0;
+  // }
+
   unsigned ops = 0;
   while (ops < max) {
 
@@ -14992,6 +15181,43 @@ uint64_t PrimaryLogPG::recover_pool_migration(
       if (!pool_migrations_in_flight.empty()) {
         // but still waiting for in flight migrations
         *work_started = true;
+      }
+      if (pool_migration_reservations_granted) {
+        dout(20) << __func__ << " Sending RELEASE messages to target PGs" << dendl;
+        // Need Connor's code here
+        // std::vector<pg_t> target_pgs = get_migration_target_pgs();
+        pg_t source_pg = info.pgid.pgid; // TODO delete this
+        std::vector<pg_t> target_pgs = {pg_t(source_pg.ps(),3)}; // TODO delete this
+        for (const auto& target_pg : target_pgs) {
+          // hobject_t routing_obj(object_t(), "", CEPH_NOSNAP, target_pg.ps(), *pool.info.migration_target, "");
+          // object_locator_t target_oloc(routing_obj);
+          // target_oloc.pool = *pool.info.migration_target;
+          object_locator_t target_oloc(*pool.info.migration_target, target_pg.ps());
+
+          ObjectOperation op;
+          op.pg_poolmig_reserve_release();
+
+          SnapContext snapc;
+          osd->objecter->mutate(
+            object_t(fmt::format("poolmig_release_{:x}", target_pg.ps())),
+            target_oloc,
+            op,
+            snapc,
+            ceph::real_clock::zero(),
+            0,
+            nullptr);
+
+          dout(20) << __func__ << " Sending RELEASE to pg " << target_pg << dendl;
+        }
+        pool_migration_reservations_granted = false;
+
+        queue_peering_event(
+          PGPeeringEventRef(
+            std::make_shared<PGPeeringEvent>(
+              get_osdmap_epoch(),
+              get_osdmap_epoch(),
+              PeeringState::PoolMigrationDone()
+        )));
       }
       return ops;
     }
@@ -15121,17 +15347,213 @@ void PrimaryLogPG::stop_pool_migration_revoked()
         PeeringState::PoolMigrationStoppedRevoked())));
 }
 
-void PrimaryLogPG::on_pool_migration_target_reserved()
-{
-  //BILL:FIXME - Kick Jamies message reply (must be one waiting)
-  //BILL:FIXME - Reminder: If on_change happens need to drop Jamies message reply
-  //BILL:FIXME - Set flag indicating we have reservations and copy_from is allowed
+void PrimaryLogPG::on_pool_migration_target_reserved() {
+  dout(20) << __func__ << dendl;
+  // pool_migration_target_has_reservations = true;
+  //
+  if (pending_pool_migration_take_op) {
+    auto& osd_op = pending_pool_migration_take_ops[0];
+    dout(20) << __func__ << " sending response, osd_op is " << osd_op << dendl;
+    pg_poolmig_response_t response(0);
+    encode(response, osd_op.outdata);
+
+    MOSDOp *m = static_cast<MOSDOp*>(pending_pool_migration_take_op->get_nonconst_req());
+    MOSDOpReply *reply = new MOSDOpReply(m, 0, get_osdmap_epoch(),
+                                         CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK, false);
+    reply->claim_op_out_data(pending_pool_migration_take_ops);
+    m->get_connection()->send_message(reply);
+
+    pending_pool_migration_take_op.reset();
+    pending_pool_migration_take_ops.clear();
+  } else {
+    dout(20) << __func__ << " no pending op to complete???" << dendl;
+  }
 }
 
 void PrimaryLogPG::on_pool_migration_target_suspended(bool toofull)
 {
-  //BILL:FIXME - Kick Jamies message reply (may be one waiting)
-  //BILL:FIXME - Set flag indicating copy_from must be failed
+  dout(20) << __func__ << " toofull=" << toofull << dendl;
+  //test out skipping this for now to see if migrations work...
+  //return;
+  //pool_migration_target_has_reservations = false;
+
+  // Complete the pending TAKE operation with failure
+  int result = toofull ? -ENOSPC : -ECANCELED;
+
+  if (pending_pool_migration_take_op) {
+    auto& osd_op = pending_pool_migration_take_ops[0];
+    pg_poolmig_response_t response(result);
+    encode(response, osd_op.outdata);
+
+    MOSDOp *m = static_cast<MOSDOp*>(pending_pool_migration_take_op->get_nonconst_req());
+    MOSDOpReply *reply = new MOSDOpReply(m, result, get_osdmap_epoch(),
+                                         CEPH_OSD_FLAG_ACK | CEPH_OSD_FLAG_ONDISK, false);
+    reply->claim_op_out_data(pending_pool_migration_take_ops);
+    m->get_connection()->send_message(reply);
+
+    pending_pool_migration_take_op.reset();
+    pending_pool_migration_take_ops.clear();
+  } else {
+    dout(20) << __func__ << " no pending op to suspend???" << dendl;
+  }
+}
+
+/**
+ * recover_pool_migration_deletion
+ *
+ * Incrementally delete objects from pool_migration_deletion_start_obj.
+ * Called from recover_pool_migration() to handle deletion in batches.
+ * Returns number of objects deleted.
+ */
+
+// TODO
+uint64_t PrimaryLogPG::recover_pool_migration_deletion(uint64_t max) {
+  if (!pool_migration_needs_deletion) {
+    return 0;
+  }
+
+  if (pool_migration_deletion_current.is_min()) {
+    pool_migration_deletion_current = pool_migration_deletion_start_obj;
+  }
+
+  hobject_t pg_end = info.pgid.pgid.get_hobj_end(pool.info.get_pg_num());
+  vector<hobject_t> objects;
+  hobject_t next;
+  uint64_t deleted = 0;
+
+  int r = pgbackend->objects_list_partial(
+    pool_migration_deletion_current,
+    cct->_conf->osd_backfill_scan_min,
+    cct->_conf->osd_backfill_scan_max,
+    &objects,
+    &next);
+
+  if (r < 0) {
+    dout(20) << __func__ << " objects_list_partial failed: " << cpp_strerror(r) << dendl;
+    pool_migration_needs_deletion = false;
+    return 0;
+  }
+
+  for (const auto& obj : objects) {
+    if (obj >= pg_end) break;
+    if (deleted >= max) break;
+
+    ObjectContextRef obc = get_object_context(obj, false);
+    if (!obc) continue;
+
+    OpContextUPtr ctx = simple_opc_create(obc);
+    ctx->at_version = get_next_version();
+
+    int del_r = _delete_oid(ctx.get(), false, false);
+    if (del_r == 0) {
+      if (obc->obs.oi.is_omap()) {
+        ctx->delta_stats.num_objects_omap--;
+      }
+      finish_ctx(ctx.get(), pg_log_entry_t::DELETE);
+      simple_opc_submit(std::move(ctx));
+      deleted++;
+    }
+  }
+
+  if (next == pool_migration_deletion_current || next >= pg_end) {
+    pool_migration_needs_deletion = false;
+    pool_migration_deletion_current = hobject_t();
+    dout(20) << __func__ << " completed incremental deletion, deleted "
+             << deleted << " objects" << dendl;
+  } else {
+    pool_migration_deletion_current = next;
+    dout(20) << __func__ << " deleted " << deleted
+             << " objects, more remain" << dendl;
+  }
+
+  return deleted;
+}
+
+void PrimaryLogPG::send_pool_migration_take_to_target() {
+  dout(20) << __func__ << dendl;
+
+  if (pool_migration_waiting_for_reservations ||
+      pool_migration_reservations_granted) {
+    dout(20) << __func__ << " already waiting for or have reservations, skipping" << dendl;
+    return;
+  }
+  pool_migration_waiting_for_reservations = true;
+
+  if (!pool.info.migration_target) {
+    ceph_abort_msg("Target PGs should not be sending pool migration reservation requests!");
+  }
+  // Need Connor's code here
+  // std::vector<pg_t> target_pgs = get_migration_target_pgs();
+  pg_t source_pg = info.pgid.pgid; // TODO delete this
+  std::vector<pg_t> target_pgs = {pg_t(source_pg.ps(),3)}; // TODO delete this
+  int num_targets = target_pgs.size();
+  int64_t total_num_objects = info.stats.stats.sum.num_objects;
+  int64_t total_num_bytes = info.stats.stats.sum.num_bytes;
+
+  pending_reservation_requests.clear();
+  pending_reservation_count = 0;
+
+  for (const auto& target_pg : target_pgs) {
+    int64_t target_num_objects = total_num_objects / num_targets;
+    int64_t target_num_bytes = total_num_bytes / num_targets;
+
+    // object_locator_t target_oloc(pool_migration_watermark);
+    // target_oloc.pool = *pool.info.migration_target;
+    object_locator_t target_oloc(*pool.info.migration_target, target_pg.ps());
+
+    ObjectOperation op;
+    op.pg_poolmig_reserve_take(
+      pool_migration_watermark,
+      OSD_POOL_MIGRATION_PRIORITY_BASE,
+      target_num_bytes,
+      target_num_objects);
+
+    C_ReserveTake *fin = new C_ReserveTake(this, get_last_peering_reset());
+    SnapContext snapc;
+    ceph_tid_t tid = osd->objecter->mutate(
+      //pool_migration_watermark.oid,
+      object_t(fmt::format("poolmig_take_{:x}", target_pg.ps())),
+      target_oloc,
+      op,
+      snapc,
+      ceph::real_clock::zero(),
+      0,
+      new C_OnFinisher(fin,
+        osd->get_objecter_finisher(get_pg_shard())));
+    fin->tid = tid;
+
+    pending_reservation_requests[tid] = {
+      tid,
+      target_pg,
+      target_num_bytes,
+      target_num_objects
+    };
+    pending_reservation_count++;
+
+    dout(20) << __func__ << " Sending TAKE to pg " << target_pg
+             << " watermark=" << pool_migration_watermark
+             << " bytes=" << target_num_bytes
+             << " objects=" << target_num_objects << dendl;
+  }
+
+  //pool_migration_quiescing = false; //todo check
+  //pool_migration_failure_count = 0; //todo check
+}
+
+void PrimaryLogPG::on_pool_migration_source_reserved() {
+  dout(20) << __func__ << " Target pool has granted reservation, starting migration" << dendl;
+}
+
+void PrimaryLogPG::on_pool_migration_reservation_revoked() {
+  dout(20) << __func__ << dendl;
+
+  if (!pool_migration_reservations_granted) {
+    return;
+  }
+
+  //todo - check these
+  pool_migration_reservations_granted = false;
+  pool_migration_quiescing = true;
 }
 
 // ===========================

@@ -526,6 +526,7 @@ PerfCounters *build_recoverystate_perf(CephContext *cct) {
   rs_perf.add_time_avg(rs_repwaitmigrationreserved_latency, "repwaitmigrationreserved_latency", "Rep wait migration reserved recovery state latency");
   rs_perf.add_time_avg(rs_migratingsource_latency, "migratingsource_latency", "Migrating source recovery state latency");
 
+
   return rs_perf.create_perf_counters();
 }
 

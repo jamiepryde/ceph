@@ -431,6 +431,7 @@ public:
     virtual void on_recovery_reserved() = 0;
     virtual void on_recovery_cancelled() = 0;
     virtual void on_pool_migration_source_reserved() = 0;
+    virtual void send_pool_migration_take_to_target() = 0;
     virtual void on_pool_migration_source_suspended() = 0;
     virtual void on_pool_migration_target_reserved() = 0;
     virtual void on_pool_migration_target_suspended(bool toofull) = 0;

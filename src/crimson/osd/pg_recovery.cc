@@ -741,4 +741,11 @@ void PGRecovery::on_pool_migration_target_reserved()
   // TODO
 }
 
+// void PGRecovery::on_pool_migration_reservation_complete(
+//   const hobject_t& start_obj, int result)
+// {
+//   // Not implemented in crimson yet
+//   ceph_abort("on_pool_migration_reservation_complete not implemented in crimson");
+// }
+
 }

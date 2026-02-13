@@ -1094,6 +1094,10 @@ class MockPeeringListener : public PeeringState::PeeringListener {
     pool_migration_target_suspended_toofull = toofull;
   }
 
+  void send_pool_migration_take_to_target() override {
+  //TODO
+  }
+
   bool try_reserve_recovery_space(
     int64_t primary_num_bytes,
     int64_t local_num_bytes,
