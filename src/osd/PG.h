@@ -1303,6 +1303,7 @@ protected:
   bool is_down() const { return recovery_state.is_down(); }
   bool is_recovery_unfound() const { return recovery_state.is_recovery_unfound(); }
   bool is_backfill_unfound() const { return recovery_state.is_backfill_unfound(); }
+  bool is_migration_unfound() const { return recovery_state.is_migration_unfound(); }
   bool is_incomplete() const { return recovery_state.is_incomplete(); }
   bool is_clean() const { return recovery_state.is_clean(); }
   bool is_undersized() const { return recovery_state.is_undersized(); }

@@ -314,6 +314,20 @@ struct ObjectOperation {
     osd_op.op.alloc_hint.expected_write_size = expected_write_size;
     osd_op.op.alloc_hint.flags = flags;
   }
+  void add_pg_pool_migration_reserve(int op, const hobject_t& start_obj,
+                                     int64_t num_bytes, int64_t num_objects,
+                                     epoch_t epoch) {
+    using ceph::encode;
+    OSDOp& osd_op = add_op(op);
+    encode(start_obj, osd_op.indata);
+    encode(epoch, osd_op.indata);
+    osd_op.op.pool_migration_reserve.num_bytes = num_bytes;
+    osd_op.op.pool_migration_reserve.num_objects = num_objects;
+  }
+  void add_pg_pool_migration_release(int op) {
+    using ceph::encode;
+    add_op(op);
+  }
 
   // ------
 
@@ -335,6 +349,21 @@ struct ObjectOperation {
     else
       add_pgls_filter(CEPH_OSD_OP_PGNLS_FILTER, count, filter, cookie,
 		      start_epoch);
+    flags |= CEPH_OSD_FLAG_PGOP;
+  }
+
+  void pg_pool_migration_reserve(const hobject_t& start_obj,
+                                 int64_t num_bytes,
+                                 int64_t num_objects,
+                                 epoch_t epoch) {
+    add_pg_pool_migration_reserve(CEPH_OSD_OP_PG_POOL_MIGRATION_RESERVE,
+                                  start_obj, num_bytes, num_objects,
+                                  epoch);
+    flags |= CEPH_OSD_FLAG_PGOP;
+  }
+
+  void pg_pool_migration_release() {
+    add_pg_pool_migration_release(CEPH_OSD_OP_PG_POOL_MIGRATION_RELEASE);
     flags |= CEPH_OSD_FLAG_PGOP;
   }
 
