@@ -3161,6 +3161,75 @@ int Objecter::_calc_target(op_target_t *t, bool any_change)
       t->osd = -1;
       return RECALC_OP_TARGET_POOL_DNE;
     }
+    actual_ps = ceph_stable_mod(pgid.ps(), pg_num, pg_num_mask);
+    actual_pgid = pg_t(actual_ps, pgid.pool());
+    if (pi->is_migration_src()) {
+      // pool is migrating or has finished migration
+      const pg_pool_t *tpi = osdmap->get_pg_pool(*pi->migration_target);
+      if (!tpi) {
+        t->osd = -1;
+        return RECALC_OP_TARGET_POOL_DNE;
+      }
+      if (tpi->has_flag(pg_pool_t::FLAG_EIO)) {
+        return RECALC_OP_TARGET_POOL_EIO;
+      }
+      bool migrated = false;
+      if (!tpi->is_migration_target()) {
+        // pool migration has finished
+        migrated = true;
+      } else {
+        if (*tpi->migration_src != t->target_oloc.pool) {
+          // cascaded pool migration, redirect to latest source pool
+          // first, then work out the state of this migration
+          const pg_pool_t *spi = osdmap->get_pg_pool(*tpi->migration_src);
+          if (!spi) {
+            t->osd = -1;
+            return RECALC_OP_TARGET_POOL_DNE;
+          }
+          if (spi->has_flag(pg_pool_t::FLAG_EIO)) {
+            return RECALC_OP_TARGET_POOL_EIO;
+          }
+          t->target_oloc.pool = *tpi->migration_src;
+          pi = spi;
+          pg_num = pi->get_pg_num();
+          pg_num_mask = pi->get_pg_num_mask();
+          // Recalculate pgid for the target pool
+          int ret = osdmap->object_locator_to_pg(t->target_oid, t->target_oloc,
+                                                 pgid);
+          if (ret == -ENOENT) {
+            t->osd = -1;
+            return RECALC_OP_TARGET_POOL_DNE;
+          }
+          actual_ps = ceph_stable_mod(pgid.ps(), pg_num, pg_num_mask);
+          actual_pgid = pg_t(actual_ps, pgid.pool());
+        }
+        if (pi->has_pg_migrated(actual_pgid)) {
+          // PG has finished migration
+          migrated = true;
+        } else if (pi->is_pg_migrating(actual_pgid)) {
+          // PG is migrating - check watermark
+          const auto& iter = pool_migration_watermarks.find(actual_pgid);
+          if (iter != pool_migration_watermarks.end()) {
+            migrated = (t->get_hobj(pgid) < iter->second);
+          }
+        } // else: PG has not started migration
+      }
+      if (migrated) {
+        t->target_oloc.pool = *pi->migration_target;
+        pi = tpi;
+        pg_num = pi->get_pg_num();
+        pg_num_mask = pi->get_pg_num_mask();
+        // Recalculate pgid for the target pool
+        int ret = osdmap->object_locator_to_pg(t->target_oid, t->target_oloc,
+                                               pgid);
+        if (ret == -ENOENT) {
+          t->osd = -1;
+          return RECALC_OP_TARGET_POOL_DNE;
+        }
+        actual_ps = ceph_stable_mod(pgid.ps(), pg_num, pg_num_mask);
+        actual_pgid = pg_t(actual_ps, pgid.pool());
+      }
+    }
   }
   ldout(cct,20) << __func__ << " target " << t->target_oid << " "
 		<< t->target_oloc << " -> pgid " << pgid << dendl;
@@ -3901,13 +3970,92 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
 
     // FIXME: two redirects could race and reorder
 
-    op->tid = 0;
-    m->get_redirect().combine_with_locator(op->target.target_oloc,
-					   op->target.target_oid.name);
-    op->target.flags |= (CEPH_OSD_FLAG_REDIRECTED |
-			 CEPH_OSD_FLAG_IGNORE_CACHE |
-			 CEPH_OSD_FLAG_IGNORE_OVERLAY);
-    _op_submit(op, sul, NULL);
+      // Calculate previous and new watermark
+      hobject_t previous_watermark;
+      hobject_t new_watermark;
+      std::list<Op*> retry;
+      {
+        const auto& it = pool_migration_watermarks.find(m->get_pg());
+        if (it != pool_migration_watermarks.end()) {
+          previous_watermark = it->second;
+        }
+      }
+      r.update_migration_watermark(new_watermark);
+      // Remove all ops (including this one) from the OSDSession
+      // that need to be retried because the watermark has advanced.
+      // Other removed ops that are still inflight will later fail
+      // with redirect but will be ignored as stray
+      //
+      // Exclusive rwlock is required to:
+      // 1. Ensure safe update of pool_migration_watermark
+      // 2. Prevent new I/Os racing with this completion and using
+      //    the old watermark after the session lock is released
+      // 3. Permit linger ops to be moved between sessions
+      bool found = false;
+      ldout(cct, 15) << __func__ << " redirect for " << op->target.target_oid << " previous=" << previous_watermark << " new=" << new_watermark << dendl;
+      for (auto it = s->ops.begin(); it != s->ops.end(); ) {
+        if (it->second->target.actual_pgid.pgid == m->get_pg()) {
+          auto hobj = it->second->target.get_hobj(it->second->target.pgid);
+          if (previous_watermark.get_head() <= hobj && hobj < new_watermark.get_head()) {
+            ldout(cct, 20) << __func__ << " found for retrying " << it->second->tid << " " <<it->second->target.get_hobj() << dendl;
+            if (it->second->has_completion())
+              num_in_flight--;
+            retry.push_back(it->second);
+            if (it->second == op) {
+              found = true;
+            }
+            _session_op_remove(s, it);
+          } else {
+            ldout(cct, 20) << __func__ << " not retrying " << it->second->tid << " " << it->second->target.get_hobj() << dendl;
+            ++it;
+          }
+        } else {
+          ++it;
+        }
+      }
+      ceph_assert(found);
+      sl.unlock();
+
+      r.update_migration_watermark(
+         pool_migration_watermarks[m->get_pg()]);
+
+      for (auto& it : retry) {
+        _op_submit(it, sul, NULL);
+      }
+      retry.clear();
+
+      // Check if linger ops need moving to a different session.
+      // If they are moved then the routing for future requests
+      // is updated, they will also need to be resent to
+      // reconnect
+      auto lp = s->linger_ops.begin();
+      while (lp != s->linger_ops.end()) {
+        auto linger_op = lp->second;
+        ++lp;
+        // _recalc_linger_op_target may touch linger_ops, prevent
+        // iterator invalidation
+        rc = _recalc_linger_op_target(linger_op, sul);
+        if (rc == RECALC_OP_TARGET_NEED_RESEND) {
+          ldout(cct, 20) << __func__ << " resending linger " << linger_op << dendl;
+          _send_linger(linger_op, sul);
+        }
+      }
+    } else {
+      if (op->has_completion())
+        num_in_flight--;
+      _session_op_remove(s, op);
+      sl.unlock();
+
+      // FIXME: two redirects could race and reorder
+
+      op->tid = 0;
+      r.combine_with_locator(op->target.target_oloc,
+			     op->target.target_oid.name);
+      op->target.flags |= (CEPH_OSD_FLAG_REDIRECTED |
+			   CEPH_OSD_FLAG_IGNORE_CACHE |
+			   CEPH_OSD_FLAG_IGNORE_OVERLAY);
+      _op_submit(op, sul, NULL);
+    }
     m->put();
     return;
   }
