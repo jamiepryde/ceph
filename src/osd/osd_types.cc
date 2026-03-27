@@ -7535,6 +7535,10 @@ ostream& operator<<(ostream& out, const OSDOp& op)
       break;
     case CEPH_OSD_OP_SCRUBLS:
       break;
+    case CEPH_OSD_OP_PG_POOL_MIGRATION_RESERVE:
+      break;
+    case CEPH_OSD_OP_PG_POOL_MIGRATION_RELEASE:
+      break;
     }
   }
   if (op.indata.length()) {
