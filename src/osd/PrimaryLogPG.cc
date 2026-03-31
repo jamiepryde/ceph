@@ -1649,6 +1649,12 @@ void PrimaryLogPG::do_pg_op(OpRequestRef op)
 
     case CEPH_OSD_OP_PG_POOL_MIGRATION_RESERVE:
       {
+        dout(20) << __func__ << " CEPH_OSD_OP_PG_POOL_MIGRATION_RESERVE" << dendl;
+        if (pending_pool_migration_reservation_op) {
+          dout(20) << __func__ << " PG_POOL_MIGRATION_RESERVE request received when one is still in flight" << dendl;
+          return; // TODO what should we actually do here?
+        }
+
         hobject_t start_obj;
         int64_t source_num_bytes = p->op.pool_migration_reserve.num_bytes;
         int64_t source_num_objects = p->op.pool_migration_reserve.num_objects;
@@ -1679,6 +1685,7 @@ void PrimaryLogPG::do_pg_op(OpRequestRef op)
 
     case CEPH_OSD_OP_PG_POOL_MIGRATION_RELEASE:
       {
+        dout(20) << __func__ << " CEPH_OSD_OP_PG_POOL_MIGRATION_RELEASE" << dendl;
         stop_target_pool_migration();
 
         pg_pool_migration_reservation_response_t response(0);
@@ -8259,12 +8266,11 @@ int PrimaryLogPG::do_osd_ops(OpContext *ctx, vector<OSDOp>& ops)
 	bool is_pool_migration = (op.copy_from.flags & CEPH_OSD_COPY_FROM_FLAG_POOL_MIGRATION);
 	if (is_pool_migration) {
 	  // Verify target has reservations for pool migration
-    // FIXME: Needs Jamie's reservation code for pool_migration_target_has_reservations to be set correctly
-//	  if (!pool_migration_target_has_reservations) {
-//	    dout(10) << "copy_from with pool migration flag but target does not have reservations" << dendl;
-//	    result = -EAGAIN;  // Tell source to retry after getting reservations
-//	    break;
-//	  }
+	  if (!pool_migration_target_reservations_granted_target) {
+	    dout(10) << "copy_from with pool migration flag but target does not have reservations" << dendl;
+	    result = -EAGAIN;  // Tell source to retry after getting reservations
+	    break;
+	  }
 
 	  dout(20) << "copy_from for pool migration with reservations, proceeding" << dendl;
 	}
@@ -13309,7 +13315,7 @@ void PrimaryLogPG::_on_activate_committed(HBHandle *handle)
   }
 
   pool_migrations_in_flight.clear();
-  pool_migration_reservations_granted = false;
+  pool_migration_target_reservations_granted_source = false;
   pool_migration_waiting_for_reservations = false;
   new_pool_migration_interval_in_flight = false;
 
@@ -15104,10 +15110,19 @@ struct C_PoolMigrationReservationCallback : public Context {
     }
 
     pg->pool_migration_waiting_for_reservations = false;
-    pg->pool_migration_reservations_granted = true;
+    pg->pool_migration_target_reservations_granted_source = true;
     pg->PG::on_pool_migration_source_reserved();
   }
 };
+
+void PrimaryLogPG::pg_on_pool_migration_source_suspended()
+{
+  dout(20) << __func__ << dendl;
+  pool_migration_target_reservations_granted_source = false;
+  pool_migration_waiting_for_reservations = false;
+  pool_migration_target_pg.reset();
+  pool_migration_target_pgs.clear();
+}
 
 bool PrimaryLogPG::pool_migration_source_delete(hobject_t oid)
 {
@@ -15394,7 +15409,7 @@ uint64_t PrimaryLogPG::recover_pool_migration(
 
     pg_t current_target_pg = get_target_pg_from_hash(soid);
     dout(20) << __func__ << " current_target_pg: " << current_target_pg << dendl;
-    if (pool_migration_reservations_granted &&
+    if (pool_migration_target_reservations_granted_source &&
       *pool_migration_target_pg != current_target_pg) {
       if (!pool_migrations_in_flight.empty()) {
         dout(20) << __func__ << " waiting for migrations in flight to complete before releasing reservation" << dendl;
@@ -15406,7 +15421,7 @@ uint64_t PrimaryLogPG::recover_pool_migration(
       return ops;
     }
 
-    if (!pool_migration_reservations_granted) {
+    if (!pool_migration_target_reservations_granted_source) {
       pool_migration_request_target_reservation();
       return ops;
     }
@@ -15521,6 +15536,8 @@ void PrimaryLogPG::on_pool_migration_source_reserved() {
 
 void PrimaryLogPG::on_pool_migration_target_reserved() {
   dout(20) << __func__ << dendl;
+  pool_migration_target_reservations_granted_target = true;
+
   ceph_assert(pending_pool_migration_reservation_op);
   ceph_assert(pending_pool_migration_reservation_ops.size() == 1);
   auto& osd_op = pending_pool_migration_reservation_ops[0];
@@ -15540,9 +15557,13 @@ void PrimaryLogPG::on_pool_migration_target_reserved() {
 void PrimaryLogPG::on_pool_migration_target_suspended(bool toofull)
 {
   dout(20) << __func__ << " toofull=" << toofull << dendl;
-  int result = toofull ? -ENOSPC : -ECANCELED;
+  pool_migration_target_reservations_granted_target = false;
 
-  ceph_assert(pending_pool_migration_reservation_op);
+  if (!pending_pool_migration_reservation_op) {
+    return;
+  }
+
+  int result = toofull ? -ENOSPC : -ECANCELED;
   ceph_assert(pending_pool_migration_reservation_ops.size() == 1);
   auto& osd_op = pending_pool_migration_reservation_ops[0];
   pg_pool_migration_reservation_response_t response(result);
@@ -15562,7 +15583,7 @@ void PrimaryLogPG::pool_migration_request_target_reservation() {
   dout(20) << __func__ << dendl;
 
   if (pool_migration_waiting_for_reservations ||
-      pool_migration_reservations_granted) {
+      pool_migration_target_reservations_granted_source) {
     dout(20) << __func__ << " already waiting for or have reservations, skipping" << dendl;
     return;
   }
@@ -15607,6 +15628,9 @@ void PrimaryLogPG::pool_migration_request_target_reservation() {
     num_objects);
 
   C_PoolMigrationReservationCallback *fin = new C_PoolMigrationReservationCallback(this, get_last_peering_reset());
+  unsigned p = op.ops.size() - 1;
+  op.out_bl[p] = &fin->outbl;
+
   SnapContext snapc;
   ceph_tid_t tid = osd->objecter->mutate(
     object_t(fmt::format("poolmig_take_{:x}", pool_migration_target_pg->ps())),
@@ -15627,7 +15651,7 @@ void PrimaryLogPG::pool_migration_request_target_reservation() {
 
 void PrimaryLogPG::pool_migration_release_target_reservation()
 {
-  if (!pool_migration_reservations_granted || !pool_migration_target_pg) {
+  if (!pool_migration_target_reservations_granted_source || !pool_migration_target_pg) {
     return;
   }
 
@@ -15650,7 +15674,7 @@ void PrimaryLogPG::pool_migration_release_target_reservation()
     0,
     nullptr);
 
-  pool_migration_reservations_granted = false;
+  pool_migration_target_reservations_granted_source = false;
   pool_migration_target_pg.reset();
 }
 

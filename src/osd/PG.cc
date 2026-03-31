@@ -1577,6 +1577,7 @@ void PG::on_recovery_reserved()
 
 void PG::on_pool_migration_source_reserved()
 {
+  dout(20) << __func__ << dendl;
   state_set(PG_STATE_MIGRATING);
   state_clear(PG_STATE_MIGRATION_TOOFULL);
   state_clear(PG_STATE_MIGRATION_WAIT);
@@ -1585,7 +1586,10 @@ void PG::on_pool_migration_source_reserved()
 
 void PG::on_pool_migration_source_suspended()
 {
+  dout(20) << __func__ << dendl;
   //BILL:FIXME: need to clean up async work here - see on_backfill_suspended for example
+
+  pg_on_pool_migration_source_suspended();
 }
 
 void PG::set_not_ready_to_merge_target(pg_t pgid, pg_t src)

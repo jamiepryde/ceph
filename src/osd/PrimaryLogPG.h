@@ -1201,8 +1201,10 @@ protected:
 
   /// objects waiting for lock retry to delete source after successful copy_from
   std::list<hobject_t> pool_migration_source_delete_pending_lock;
-  /// target PG in pool migration has taken reservations and replied
-  bool pool_migration_reservations_granted = false;
+  /// source PG tracking of whether target has granted reservations
+  bool pool_migration_target_reservations_granted_source = false;
+  /// target PG tracking of whether target has granted reservations
+  bool pool_migration_target_reservations_granted_target = false;
   /// current migration target pg
   std::optional<pg_t> pool_migration_target_pg;
   /// list of all target pgs a particular source pg will migrate to
@@ -1216,6 +1218,7 @@ protected:
   std::vector<OSDOp> pending_pool_migration_reservation_ops;
 
   void initialize_pool_migration_target_pg_list();
+  void pg_on_pool_migration_source_suspended() override;
   hobject_t next_pool_migration(std::optional<hobject_t> start);
   hobject_t earliest_pool_migration()
   {

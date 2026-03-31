@@ -628,6 +628,7 @@ public:
   void on_recovery_cancelled() override {}
   void on_recovery_reserved() override;
   void on_pool_migration_source_suspended() override;
+  virtual void pg_on_pool_migration_source_suspended() = 0;
   void on_pool_migration_source_reserved() override;
 
   bool is_forced_recovery_or_backfill() const {
