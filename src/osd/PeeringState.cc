@@ -7100,6 +7100,17 @@ PeeringState::Clean::react(const StartTargetPoolMigration &evt)
   return transit<WaitRemotePoolMigrationReserved>();
 }
 
+boost::statechart::result
+PeeringState::Clean::react(const RemotePoolMigrationReserved &evt)
+{
+  DECLARE_LOCALS;
+  // This is a late/stale reservation message that arrived after we already
+  // revoked the reservation and returned to Clean state. This can happen
+  // when OSDs are thrashing (going up/down rapidly). Just ignore it.
+  psdout(10) << "Clean: ignoring stale RemotePoolMigrationReserved event" << dendl;
+  return discard_event();
+}
+
 void PeeringState::Clean::exit()
 {
   context< PeeringMachine >().log_exit(state_name, enter_time);
