@@ -7721,12 +7721,13 @@ int OSDMonitor::prepare_new_pool(MonOpRequestRef op)
   bool bulk = false;
   int ret = 0;
   ret = prepare_new_pool(m->name, m->crush_rule, rule_name,
-			 0, 0, 0, 0, 0, 0, 0.0,
-			 erasure_code_profile,
-			 pg_pool_t::TYPE_REPLICATED, 0, FAST_READ_OFF, {}, bulk,
-			 cct->_conf.get_val<bool>("osd_pool_default_crimson"),
-			 std::nullopt,
-			 &ss);
+                         0, 0, 0, 0, 0, 0, 0.0,
+                         erasure_code_profile,
+                         pg_pool_t::TYPE_REPLICATED, 0, FAST_READ_OFF, {}, bulk,
+                         cct->_conf.get_val<bool>("osd_pool_default_crimson"),
+                         std::nullopt,
+                         false, // enable_ec_optimizations
+                         &ss);
 
   if (ret < 0) {
     dout(10) << __func__ << " got " << ret << " " << ss.str() << dendl;
@@ -8382,6 +8383,7 @@ int OSDMonitor::prepare_new_pool(string& name,
 				 bool bulk,
 				 bool crimson,
 				 const std::optional<int64_t> source_pool_id,
+				 bool enable_ec_optimizations,
 				 ostream *ss)
 {
   if (crimson && pg_autoscale_mode.empty()) {
@@ -8664,6 +8666,12 @@ int OSDMonitor::prepare_new_pool(string& name,
       (pool_type == pg_pool_t::TYPE_REPLICATED ||
        (pi->allows_ecoptimizations() && !crimson))) {
     pi->set_flag(pg_pool_t::FLAG_OMAP);
+  }
+
+  if (enable_ec_optimizations) {
+    // Enable EC optimizations if requested via command line flag.
+    // Errors are silently ignored (e.g., non-EC pool, unsupported profile).
+    enable_pool_ec_optimizations(*pi, nullptr, true);
   }
 
   if (source_pool_id) {
@@ -9387,7 +9395,7 @@ int OSDMonitor::prepare_command_pool_set(const cmdmap_t& cmdmap,
       // Pools with allow_ec_optimizations set store pg_temp in a different
       // order to change the primary selection algorithm without breaking
       // old clients. Modify any existing pg_temp for the pool now.
-      // This is only needed when switching on optimisations after creation.
+      // This is only needed when switching on optimizations after creation.
       for (auto pg_temp = osdmap.pg_temp->begin();
            pg_temp != osdmap.pg_temp->end();
            ++pg_temp) {
@@ -14329,19 +14337,22 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     bool crimson = cmd_getval_or<bool>(cmdmap, "crimson", default_crimson) ||
       cct->_conf.get_val<bool>("osd_pool_default_crimson");
 
+    bool enable_ec_optimizations = cmd_getval_or<bool>(cmdmap, "enable_ec_optimizations", false);
+
     err = prepare_new_pool(poolstr,
-			   -1, // default crush rule
-			   rule_name,
-			   pg_num, pgp_num, pg_num_min, pg_num_max,
+                           -1, // default crush rule
+                           rule_name,
+                           pg_num, pgp_num, pg_num_min, pg_num_max,
                            repl_size, target_size_bytes, target_size_ratio,
-			   erasure_code_profile, pool_type,
+                           erasure_code_profile, pool_type,
                            (uint64_t)expected_num_objects,
                            fast_read,
-			   pg_autoscale_mode,
-			   bulk,
-			   crimson,
-			   source_pool_id,
-			   &ss);
+                           pg_autoscale_mode,
+                           bulk,
+                           crimson,
+                           source_pool_id,
+                           enable_ec_optimizations,
+                           &ss);
     if (err < 0) {
       switch(err) {
       case -EEXIST:
