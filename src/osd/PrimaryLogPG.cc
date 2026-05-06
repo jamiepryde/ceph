@@ -10167,7 +10167,6 @@ void PrimaryLogPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
                  << cop->results.temp_oid << dendl; // BILL:FIXME remove BILL once created in testing
         ObjectContextRef tempobc = get_object_context(cop->results.temp_oid, true);
         ctx->op_t->remove(cop->results.temp_oid);
-        ctx->discard_temp_oid = cop->results.temp_oid;
         log_transaction = true;
       }
       if (add_trim_to_ctx(ctx.get(), oid, oid.snap, cobc, head_obc) < 0) {
@@ -10247,9 +10246,6 @@ void PrimaryLogPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
     }
     ObjectContextRef tempobc = get_object_context(cop->results.temp_oid, true);
     OpContextUPtr ctx = simple_opc_create(tempobc);
-    if (cop->temp_cursor.is_initial()) {
-      ctx->new_temp_oid = cop->results.temp_oid;
-    }
     _write_copy_chunk(cop, ctx->op_t.get());
     simple_opc_submit(std::move(ctx));
     dout(10) << __func__ << " fetching more" << dendl;
@@ -10342,7 +10338,6 @@ void PrimaryLogPG::process_copy_chunk(hobject_t oid, ceph_tid_t tid, int r)
     ObjectContextRef tempobc = get_object_context(cop->results.temp_oid, true);
     OpContextUPtr ctx = simple_opc_create(tempobc);
     ctx->op_t->remove(cop->results.temp_oid);
-    ctx->discard_temp_oid = cop->results.temp_oid;
     simple_opc_submit(std::move(ctx));
   }
 
@@ -10575,9 +10570,6 @@ void PrimaryLogPG::finish_copyfrom(CopyFromCallback *cb)
   } else {
     ctx->delta_stats.num_objects++;
     obs.exists = true;
-  }
-  if (cb->is_temp_obj_used()) {
-    ctx->discard_temp_oid = cb->results->temp_oid;
   }
   cb->results->fill_in_final_tx(ctx->op_t.get());
 
@@ -10819,9 +10811,6 @@ void PrimaryLogPG::finish_promote(int r, CopyResults *results,
     }
 
     results->fill_in_final_tx(tctx->op_t.get());
-    if (results->started_temp_obj) {
-      tctx->discard_temp_oid = results->temp_oid;
-    }
     tctx->new_obs.oi.size = results->object_size;
     tctx->new_obs.oi.user_version = results->user_version;
     tctx->new_obs.oi.mtime = ceph::real_clock::to_timespec(results->mtime);
