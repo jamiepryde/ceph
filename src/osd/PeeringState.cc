@@ -6279,6 +6279,8 @@ PeeringState::MigratingSource::MigratingSource(my_context ctx)
   context< PeeringMachine >().log_enter(state_name);
 
   DECLARE_LOCALS;
+  ps->state_clear(PG_STATE_MIGRATION_UNFOUND);
+  ps->state_clear(PG_STATE_MIGRATION_ERROR);
   pl->on_pool_migration_source_reserved();
   pl->publish_stats_to_osd();
 }
@@ -6380,6 +6382,17 @@ PeeringState::MigratingSource::react(const PoolMigrationStoppedRevoked &)
   return transit<WaitLocalPoolMigrationReserved>();
 }
 
+boost::statechart::result
+PeeringState::MigratingSource::react(const PoolMigrationStoppedError &evt)
+{
+  DECLARE_LOCALS;
+  psdout(1) << "migration stopped due to I/O error " << evt.error_code << dendl;
+  ps->state_set(PG_STATE_MIGRATION_ERROR);
+  ps->state_clear(PG_STATE_MIGRATING);
+  suspend_migration();
+  return transit<NotMigrating>();
+}
+
 void PeeringState::MigratingSource::exit()
 {
   context< PeeringMachine >().log_exit(state_name, enter_time);
@@ -6399,6 +6412,8 @@ PeeringState::MigratingTarget::MigratingTarget(my_context ctx)
   DECLARE_LOCALS;
   ps->state_clear(PG_STATE_MIGRATION_TOOFULL);
   ps->state_clear(PG_STATE_MIGRATION_WAIT);
+  ps->state_clear(PG_STATE_MIGRATION_UNFOUND);
+  ps->state_clear(PG_STATE_MIGRATION_ERROR);
   ps->state_set(PG_STATE_MIGRATING);
   pl->on_pool_migration_target_reserved();
   pl->publish_stats_to_osd();
@@ -6475,7 +6490,6 @@ void PeeringState::MigratingTarget::exit()
   context< PeeringMachine >().log_exit(state_name, enter_time);
   DECLARE_LOCALS;
   ps->state_clear(PG_STATE_MIGRATING);
-  migration_release_reservations();
   utime_t dur = ceph_clock_now() - enter_time;
   pl->get_peering_perf().tinc(rs_migratingsource_latency, dur);
 }
@@ -6495,6 +6509,8 @@ PeeringState::WaitRemotePoolMigrationReserved::WaitRemotePoolMigrationReserved(m
   if (!ps->state_test(PG_STATE_MIGRATION_TOOFULL)) {
     ps->state_set(PG_STATE_MIGRATION_WAIT);
   }
+  ps->state_clear(PG_STATE_MIGRATION_UNFOUND);
+  ps->state_clear(PG_STATE_MIGRATION_ERROR);
   pl->publish_stats_to_osd();
   post_event(RemotePoolMigrationReserved());
 }
@@ -6662,14 +6678,14 @@ PeeringState::WaitLocalPoolMigrationReserved::WaitLocalPoolMigrationReserved(my_
   context< PeeringMachine >().log_enter(state_name);
   DECLARE_LOCALS;
 
-  pl->on_pool_migration_source_starting();
-
   // If first attempt at acquiring reservation set WAIT,
   // if retrying then retain either TOOFULL or WAIT from
   // previous attempt
   if (!ps->state_test(PG_STATE_MIGRATION_TOOFULL)) {
     ps->state_set(PG_STATE_MIGRATION_WAIT);
   }
+  ps->state_clear(PG_STATE_MIGRATION_UNFOUND);
+  ps->state_clear(PG_STATE_MIGRATION_ERROR);
   pl->request_local_background_io_reservation(
     ps->get_pool_migration_priority(),
     std::make_unique<PGPeeringEvent>(
@@ -6680,7 +6696,6 @@ PeeringState::WaitLocalPoolMigrationReserved::WaitLocalPoolMigrationReserved(my_
       ps->get_osdmap_epoch(),
       ps->get_osdmap_epoch(),
       DeferPoolMigration(0.0)));
-  pl->pool_migration_request_target_reservation();
   pl->publish_stats_to_osd();
 }
 

@@ -444,7 +444,6 @@ public:
     virtual void on_backfill_suspended() = 0;
     virtual void on_recovery_reserved() = 0;
     virtual void on_recovery_cancelled() = 0;
-    virtual void on_pool_migration_source_starting() = 0;
     virtual void on_pool_migration_source_reserved() = 0;
     virtual void on_pool_migration_source_suspended() = 0;
     virtual void on_pool_migration_target_reserved() = 0;
@@ -599,6 +598,15 @@ public:
   TrivialEvent(PoolMigrationStoppedUnfound)
   TrivialEvent(PoolMigrationStoppedTooFull)
   TrivialEvent(PoolMigrationStoppedRevoked)
+
+  struct PoolMigrationStoppedError : boost::statechart::event< PoolMigrationStoppedError > {
+    int error_code;
+    explicit PoolMigrationStoppedError(int err) : error_code(err) {}
+    void print(std::ostream *out) const {
+      *out << "PoolMigrationStoppedError(" << error_code << ")";
+    }
+  };
+
   TrivialEvent(StopTargetPoolMigration)
 
   TrivialEvent(AllReplicasActivated)
@@ -1114,7 +1122,8 @@ public:
       boost::statechart::custom_reaction< DeferPoolMigration >,
       boost::statechart::custom_reaction< PoolMigrationStoppedUnfound >,
       boost::statechart::custom_reaction< PoolMigrationStoppedTooFull>,
-      boost::statechart::custom_reaction< PoolMigrationStoppedRevoked >
+      boost::statechart::custom_reaction< PoolMigrationStoppedRevoked >,
+      boost::statechart::custom_reaction< PoolMigrationStoppedError >
       > reactions;
     explicit MigratingSource(my_context ctx);
     void migration_release_reservations();
@@ -1124,12 +1133,13 @@ public:
     boost::statechart::result react(const PoolMigrationStoppedUnfound& evt);
     boost::statechart::result react(const PoolMigrationStoppedTooFull& evt);
     boost::statechart::result react(const PoolMigrationStoppedRevoked& evt);
+    boost::statechart::result react(const PoolMigrationStoppedError& evt);
     void exit();
   };
 
   struct MigratingTarget : boost::statechart::state< MigratingTarget, Active >, NamedState {
     typedef boost::mpl::list<
-      boost::statechart::transition< StopTargetPoolMigration, Clean >,
+      boost::statechart::custom_reaction< StopTargetPoolMigration >,
       boost::statechart::custom_reaction< DoRecovery >,
       boost::statechart::custom_reaction< RemotePoolMigrationRejectedTooFull >,
       boost::statechart::custom_reaction< RemotePoolMigrationRevoked >,
