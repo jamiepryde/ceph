@@ -13642,6 +13642,7 @@ void PrimaryLogPG::_on_activate_committed(HBHandle *handle)
 
   if (pool.info.is_pg_migrating(info.pgid.pgid)) {
     pool_migration_info.reset(hobject_t());
+    pool_migration_info.version = info.last_update;
     scan_range_migration(
       cct->_conf->osd_backfill_scan_min,
       cct->_conf->osd_backfill_scan_max,
@@ -15147,7 +15148,8 @@ void PrimaryLogPG::update_range(
     pmi->version = info.last_update;
     scan_range_migration(local_min, local_max, pmi, handle);
   } else if (*watermark >= pmi->end || pmi->empty()) {
-    dout(10) << func_name << " no migration targets in pmi, rescanning" << dendl;
+    dout(10) << func_name << ": no migration targets in pmi, rescanning" << dendl;
+    pmi->version = info.last_update;
     scan_range_migration(local_min, local_max, pmi, handle);
   }
 
