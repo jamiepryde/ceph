@@ -15523,7 +15523,7 @@ struct C_PoolMigrationReservationCallback : public Context {
     }
 
     pg->pool_migration_reservations_granted_source = true;
-    pg->PG::on_pool_migration_source_reserved();
+    pg->queue_recovery();
   }
 };
 
@@ -16217,10 +16217,6 @@ void PrimaryLogPG::stop_pool_migration_error(int error_code)
         PeeringState::PoolMigrationStoppedError(error_code))));
 }
 
-void PrimaryLogPG::on_pool_migration_source_reserved() {
-  dout(20) << __func__ << dendl;
-}
-
 void PrimaryLogPG::on_pool_migration_target_reserved() {
   dout(20) << __func__ << dendl;
 
@@ -16286,7 +16282,7 @@ void PrimaryLogPG::pool_migration_request_target_reservation() {
   C_PoolMigrationReservationCallback *fin = new C_PoolMigrationReservationCallback(this, get_last_peering_reset());
   SnapContext snapc;
   ceph_tid_t tid = osd->objecter->mutate(
-    object_t(fmt::format("poolmig_take_{:x}", pool_migration_target_pg->ps())),
+    object_t(fmt::format("pool_migration_reserve_{:x}", pool_migration_target_pg->ps())),
     target_oloc,
     op,
     snapc,
@@ -16315,7 +16311,7 @@ void PrimaryLogPG::pool_migration_release_target_reservation()
 
   SnapContext snapc;
   osd->objecter->mutate(
-    object_t(fmt::format("poolmig_release_{:x}", pool_migration_target_pg->ps())),
+    object_t(fmt::format("pool_migration_release_{:x}", pool_migration_target_pg->ps())),
     target_oloc,
     op,
     snapc,
@@ -16325,6 +16321,7 @@ void PrimaryLogPG::pool_migration_release_target_reservation()
 
   pool_migration_reservations_granted_source = false;
   pool_migration_target_pg.reset();
+  queue_recovery();
 }
 
 // ===========================
