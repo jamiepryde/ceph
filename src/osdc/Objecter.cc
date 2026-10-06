@@ -3174,6 +3174,34 @@ int Objecter::_calc_target(op_target_t *t, snapid_t snap, bool any_change)
     }
     actual_ps = ceph_stable_mod(pgid.ps(), pg_num, pg_num_mask);
     actual_pgid = pg_t(actual_ps, pgid.pool());
+    if (honor_pool_migration) {
+      // The migration target carries the user-facing pool name, so a client
+      // addressing a pool by name lands here on the target. Route the op back to
+      // the chain root as the single authority for the pool. Only targets (tips)
+      // are reverse-redirected here; ops addressed to a source stub fall through
+      // to the forward-cascade below.
+      int64_t root_pool =
+        osdmap->get_pool_migration_root_from_target(t->target_oloc.pool);
+      if (root_pool >= 0) {
+        const pg_pool_t *spi = osdmap->get_pg_pool(root_pool);
+        if (!spi) {
+          t->osd = -1;
+          return RECALC_OP_TARGET_POOL_DNE;
+        }
+        t->target_oloc.pool = root_pool;
+        pi = spi;
+        pg_num = pi->get_pg_num();
+        pg_num_mask = pi->get_pg_num_mask();
+        int ret = osdmap->object_locator_to_pg(t->target_oid, t->target_oloc,
+                                               pgid);
+        if (ret == -ENOENT) {
+          t->osd = -1;
+          return RECALC_OP_TARGET_POOL_DNE;
+        }
+        actual_ps = ceph_stable_mod(pgid.ps(), pg_num, pg_num_mask);
+        actual_pgid = pg_t(actual_ps, pgid.pool());
+      }
+    }
     if (pi->is_migration_src()) {
       // pool is migrating or has finished migration
       const pg_pool_t *tpi = osdmap->get_pg_pool(*pi->migration_target);
@@ -3993,12 +4021,11 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
 
   if (m->is_redirect_reply()) {
     ldout(cct, 5) << " got redirect reply; redirecting" << dendl;
-    if (op->has_completion())
-      num_in_flight--;
-    _session_op_remove(s, op);
-    sl.unlock();
+    const request_redirect_t& r = m->get_redirect();
 
-    // FIXME: two redirects could race and reorder
+    if (r.is_pool_migration()) {
+      //Pool migration is redirecting request to the
+      //target pool because the object has been migrated
 
       // Calculate previous and new watermark
       hobject_t previous_watermark;
@@ -4048,28 +4075,6 @@ void Objecter::handle_osd_op_reply(MOSDOpReply *m)
 
       r.update_migration_watermark(
          pool_migration_watermarks[m->get_pg()]);
-
-      for (auto& it : retry) {
-        _op_submit(it, sul, NULL);
-      }
-      retry.clear();
-
-      // Check if linger ops need moving to a different session.
-      // If they are moved then the routing for future requests
-      // is updated, they will also need to be resent to
-      // reconnect
-      auto lp = s->linger_ops.begin();
-      while (lp != s->linger_ops.end()) {
-        auto linger_op = lp->second;
-        ++lp;
-        // _recalc_linger_op_target may touch linger_ops, prevent
-        // iterator invalidation
-        rc = _recalc_linger_op_target(linger_op, sul);
-        if (rc == RECALC_OP_TARGET_NEED_RESEND) {
-          ldout(cct, 20) << __func__ << " resending linger " << linger_op << dendl;
-          _send_linger(linger_op, sul);
-        }
-      }
 
       for (auto& it : retry) {
         _op_submit(it, sul, NULL);
