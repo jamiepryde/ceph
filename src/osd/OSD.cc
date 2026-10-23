@@ -45,6 +45,7 @@
 #include "osd/scrubber/pg_scrubber.h"
 #include "osd/ECCommon.h"
 #include "osd/ECInject.h"
+#include "erasure-code/lrc/ErasureCodeLrcLayers.h"
 
 #include "include/types.h"
 #include "include/compat.h"
@@ -5151,7 +5152,22 @@ PG* OSD::_make_pg(
     pi = *createmap->get_pg_pool(pgid.pool());
     name = createmap->get_pool_name(pgid.pool());
     if (pi.is_erasure()) {
-      ec_profile = createmap->get_erasure_code_profile(pi.erasure_code_profile);
+      const string& profname = pi.erasure_code_profile;
+      ec_profile = createmap->get_erasure_code_profile(profname);
+      if (ceph::lrc_profile_missing_layer_plugin(ec_profile)) {
+	OSDMapRef curmap = get_osdmap();
+	if (curmap->has_erasure_code_profile(profname))
+	  ec_profile = curmap->get_erasure_code_profile(profname);
+	if (curmap->have_pg_pool(pgid.pool()) &&
+	    ceph::lrc_profile_missing_layer_plugin(ec_profile)) {
+	  derr << __func__ << " " << pgid << " pool '" << name
+	       << "' LRC erasure-code profile '" << profname << "' has no '"
+	       << ceph::LRC_LAYER_PLUGIN_KEY << "' set; refusing to build the PG "
+	       << "to avoid data corruption. See the recovery steps in the "
+	       << "release notes for tracker 81369." << dendl;
+	  ceph_abort_msg("LRC erasure-code profile has no layer-plugin set");
+	}
+      }
     }
   } else {
     // pool was deleted; grab final pg_pool_t off disk.
@@ -5326,6 +5342,7 @@ void OSD::load_pgs()
   }
 
   int num = 0;
+  std::set<std::string> skipped_lrc_profiles;
   for (vector<coll_t>::iterator it = ls.begin();
        it != ls.end();
        ++it) {
@@ -5349,6 +5366,23 @@ void OSD::load_pgs()
     if (r < 0) {
       derr << __func__ << " unable to peek at " << pgid << " metadata, skipping"
 	   << dendl;
+      continue;
+    }
+
+    // Skip any PG whose pool uses an LRC profile with no sub-plugin set.
+    // Skipping rather than refusing to start lets the OSD boot,
+    // fetch the monitor's current map, and pick the PG up on the next restart
+    // once layer-plugin is set (tracker 81369).
+    OSDMapRef curmap = get_osdmap();
+    const pg_pool_t *pool = curmap->get_pg_pool(pgid.pool());
+    if (pool && pool->is_erasure() &&
+	curmap->has_erasure_code_profile(pool->erasure_code_profile) &&
+	ceph::lrc_profile_missing_layer_plugin(
+	  curmap->get_erasure_code_profile(pool->erasure_code_profile))) {
+      derr << __func__ << " " << pgid << " skipped: LRC erasure-code profile '"
+           << pool->erasure_code_profile << "' has no '"
+           << ceph::LRC_LAYER_PLUGIN_KEY << "' set" << dendl;
+      skipped_lrc_profiles.insert(pool->erasure_code_profile);
       continue;
     }
 
@@ -5407,6 +5441,13 @@ void OSD::load_pgs()
     ++num;
   }
   dout(0) << __func__ << " opened " << num << " pgs" << dendl;
+  if (!skipped_lrc_profiles.empty()) {
+    clog->warn() << "did not start PGs whose LRC erasure-code profile(s) "
+		 << skipped_lrc_profiles << " have no 'layer-plugin' set; those "
+		 << "pools will be unavailable on this OSD until the key is set. "
+		 << "Set layer-plugin on each profile and restart this OSD. "
+                 << "See the release notes for tracker 81369.";
+  }
 }
 
 
