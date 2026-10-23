@@ -337,7 +337,8 @@ class CephadmUpgrade:
         'UPGRADE_INVALID_CRUSH_BUCKET',
         'UPGRADE_OSD_NO_VERSION',
         'UPGRADE_KEY_ROTATION',
-        'UPGRADE_INCOMPATIBLE_HOST_CPU'
+        'UPGRADE_INCOMPATIBLE_HOST_CPU',
+        'UPGRADE_LRC_LAYER_PLUGIN_UNSET'
     ]
 
     def __init__(self, mgr: "CephadmOrchestrator"):
@@ -625,6 +626,43 @@ class CephadmUpgrade:
             "'ceph config set mgr mgr/cephadm/upgrade_cpu_isa_check false'"
         ]
 
+    def check_lrc_layer_plugin(self, target_version: str) -> List[str]:
+        """Return the names of LRC erasure-code profiles missing 'layer-plugin'.
+
+        From tentacle on, an LRC profile must name its sub-plugin (jerasure vs
+        isa) explicitly: the two diverge on coding chunks, so an upgraded OSD
+        can no longer infer which one an existing profile was created with, and
+        guessing wrong corrupts data on recovery/degraded reads. OSDs refuse to
+        start such a pool, so we block the upgrade here with an actionable
+        message instead. Only relevant when upgrading to tentacle or
+        later; an empty list means no such profile exists.
+        """
+        try:
+            target_major = int(target_version.split('.', 1)[0])
+        except ValueError:
+            return []
+        if target_major < ceph_release_to_major('tentacle'):
+            return []
+        osdmap = self.mgr.get('osd_map')
+        profiles = osdmap.get('erasure_code_profiles', {})
+        bare = [name for name, profile in profiles.items()
+                if profile.get('plugin') == 'lrc' and 'layer-plugin' not in profile]
+        return sorted(bare)
+
+    def _lrc_layer_plugin_error_detail(self, profiles: List[str]) -> List[str]:
+        return [
+            f'LRC erasure-code profile(s) {", ".join(profiles)} do not set '
+            "'layer-plugin', which is required from tentacle onwards; using the "
+            'wrong sub-plugin corrupts data on recovery. Set it on each profile '
+            'before upgrading. Use the value the profile was created with: '
+            "'jerasure' for a profile describing data created before tentacle, "
+            "'isa' otherwise. For each profile run:",
+            '  ceph osd erasure-code-profile get <name>',
+            '  ceph osd erasure-code-profile set <name> <all settings from get> '
+            'layer-plugin=<jerasure|isa> --force --yes-i-really-mean-it',
+            'See the release notes for tracker 81369.',
+        ]
+
     def upgrade_ls(self, image: Optional[str], tags: bool, show_all_versions: Optional[bool]) -> Dict:
         if not image:
             image = self.mgr.container_image_base
@@ -795,6 +833,13 @@ class CephadmUpgrade:
                     'Cannot start upgrade. Found host(s) with a CPU that '
                     f'cannot run ceph version {version}:\n'
                     + '\n'.join(self._host_cpu_isa_error_detail(isa_errors)))
+            # Only relevant to the OSD phase, so skip for OSD-less upgrades.
+            if self._upgrade_includes_osds(daemon_types, hosts, services):
+                lrc_profiles = self.check_lrc_layer_plugin(version)
+                if lrc_profiles:
+                    raise OrchestratorError(
+                        f'Cannot start upgrade to ceph version {version}:\n'
+                        + '\n'.join(self._lrc_layer_plugin_error_detail(lrc_profiles)))
             target_name = self.mgr.container_image_base + ':v' + version
         elif image:
             target_name = normalize_image_digest(image, self.mgr.default_registry)
@@ -2336,6 +2381,22 @@ class CephadmUpgrade:
                 'detail': self._host_cpu_isa_error_detail(isa_errors),
             })
             return
+
+        # Re-check mid-flight: a keyless LRC profile can appear after the upgrade started
+        if self._upgrade_includes_osds(self.upgrade_state.daemon_types,
+                                       self.upgrade_state.hosts,
+                                       self.upgrade_state.services):
+            lrc_profiles = self.check_lrc_layer_plugin(target_version)
+            if lrc_profiles:
+                self._fail_upgrade('UPGRADE_LRC_LAYER_PLUGIN_UNSET', {
+                    'severity': 'error',
+                    'summary': f'Upgrade: {len(lrc_profiles)} LRC erasure-code '
+                               "profile(s) do not set 'layer-plugin', required "
+                               'from tentacle onwards',
+                    'count': len(lrc_profiles),
+                    'detail': self._lrc_layer_plugin_error_detail(lrc_profiles),
+                })
+                return
 
         image_settings = self.get_distinct_container_image_settings()
 
