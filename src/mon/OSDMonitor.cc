@@ -78,6 +78,7 @@
 #include "common/debug.h"
 #include "common/errno.h"
 
+#include "erasure-code/lrc/ErasureCodeLrcLayers.h"
 #include "erasure-code/ErasureCodePlugin.h"
 #include "compressor/Compressor.h"
 #include "common/Checksummer.h"
@@ -7720,8 +7721,14 @@ void OSDMonitor::check_legacy_ec_plugin(const string& plugin, const string& prof
 int OSDMonitor::normalize_profile(const string& profilename,
 				  ErasureCodeProfile &profile,
 				  bool force,
-				  ostream *ss)
+				  ostream *ss,
+				  bool set_layer_plugin)
 {
+  // Set the default LRC sub-plugin at profile creation. Skipped for existing
+  // profiles normalized for comparison.
+  if (set_layer_plugin)
+    ceph::set_lrc_layer_plugin_default(profile);
+
   ErasureCodeInterfaceRef erasure_code;
   ErasureCodePluginRegistry &instance = ErasureCodePluginRegistry::instance();
   ErasureCodeProfile::const_iterator plugin = profile.find("plugin");
@@ -8367,6 +8374,21 @@ int OSDMonitor::prepare_new_pool(string& name,
 
   if (pool_type == pg_pool_t::TYPE_REPLICATED && fast_read == FAST_READ_ON) {
     *ss << "'fast_read' can only apply to erasure coding pool";
+    return -EINVAL;
+  }
+  // This only fires for a profile left keyless before an upgrade
+  if (pool_type == pg_pool_t::TYPE_ERASURE &&
+      osdmap.has_erasure_code_profile(erasure_code_profile) &&
+      ceph::lrc_profile_missing_layer_plugin(
+        osdmap.get_erasure_code_profile(erasure_code_profile))) {
+    *ss << "erasure-code profile '" << erasure_code_profile << "' has no '"
+	<< ceph::LRC_LAYER_PLUGIN_KEY << "' set; set it on the profile before "
+	<< "creating a pool. Use the value the profile was created with "
+	<< "('jerasure' if it describes data created before tentacle, 'isa' "
+	<< "otherwise), re-specifying the full profile: 'ceph osd "
+	<< "erasure-code-profile set " << erasure_code_profile << " ... "
+	<< ceph::LRC_LAYER_PLUGIN_KEY << "=<jerasure|isa> --force "
+	<< "--yes-i-really-mean-it'. See the release notes for tracker 81369.";
     return -EINVAL;
   }
   int r;
@@ -12127,7 +12149,8 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       if (osdmap.has_erasure_code_profile(name)) {
 	ErasureCodeProfile existing_profile_map =
 	  osdmap.get_erasure_code_profile(name);
-	err = normalize_profile(name, existing_profile_map, force, &ss);
+	err = normalize_profile(name, existing_profile_map, force, &ss,
+                                /*set_layer_plugin=*/false);
 	if (err)
 	  goto reply_no_propose;
 
@@ -14136,6 +14159,9 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 						      &ss);
 	  if (err)
 	    goto reply_no_propose;
+	  // This default-profile path bypasses normalize_profile(), so set the
+	  // LRC sub-plugin here too
+	  ceph::set_lrc_layer_plugin_default(profile_map);
 	  dout(20) << "erasure code profile " << erasure_code_profile << " set" << dendl;
 	  pending_inc.set_erasure_code_profile(erasure_code_profile, profile_map);
 	  goto wait;
