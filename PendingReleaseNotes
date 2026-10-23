@@ -19,6 +19,46 @@
   ``cpu_isa_level`` host fact (e.g. ``x86-64-v2``). The check can be disabled
   with ``ceph config set mgr mgr/cephadm/upgrade_cpu_isa_check false``, e.g.
   when running custom-built images targeting an older CPU generation.
+* Erasure coding (LRC): the *lrc* plugin now records the sub-plugin used for
+  its layers in the erasure-code profile under a new ``layer-plugin`` key.
+  ``jerasure`` and ``isa`` compute identical first coding chunks but diverge on
+  later ones, so a pool must be recovered with the same sub-plugin it was
+  written with; previously the sub-plugin was inferred and could change across
+  an upgrade, silently corrupting data on recovery or degraded reads. New LRC
+  profiles default to ``layer-plugin=isa``. An LRC profile that leaves it unset
+  is now rejected when creating a pool, and an OSD will not start the PGs of a
+  pool whose LRC profile leaves it unset. Rather than guessing, it skips them
+  (the pool is unavailable on that OSD) and logs a warning until the key is set.
+
+  **Action required before upgrading** a cluster that has LRC pools to Tentacle
+  or later (including point-release upgrades between Tentacle builds): set
+  ``layer-plugin`` on every LRC profile, using the value the data was written
+  with. ``jerasure`` for a profile describing data created before Tentacle,
+  or ``isa`` otherwise. Every previous Tentacle release defaulted to
+  ``isa``, so any pool created on a Tentacle cluster was written with ``isa``.
+  Because ``erasure-code-profile set`` replaces the whole
+  profile, read the current settings first and re-specify them::
+
+    ceph osd erasure-code-profile get <name>
+    ceph osd erasure-code-profile set <name> <all existing settings> \
+        layer-plugin=<jerasure|isa> --force --yes-i-really-mean-it
+
+  cephadm blocks ``ceph orch upgrade start`` (and pauses an in-progress upgrade
+  with a new ``UPGRADE_LRC_LAYER_PLUGIN_UNSET`` health alert) while any LRC
+  profile is missing ``layer-plugin``.
+
+  **Recovery if a cluster was upgraded without setting** ``layer-plugin`` first
+  (e.g. a non-cephadm or point-release upgrade): the OSDs still start, but skip
+  the PGs of the affected LRC pools (which become unavailable) and log a
+  warning. Set ``layer-plugin`` on the affected profile(s) as above, then
+  restart those OSDs; on restart they load the PGs normally.
+
+  **Do not create new LRC pools during an upgrade** until every OSD has
+  been upgraded. An upgraded monitor stamps ``layer-plugin=isa`` into a new
+  profile, but pre-Tentacle OSDs do not understand the key and write the layers
+  with their old default (``jerasure``); data written in that window would then
+  be read with the wrong sub-plugin once those OSDs upgrade. Wait until the OSD
+  upgrade is complete before creating LRC pools.
 
 * RBD: The Python ``Image.list_lockers()`` method now returns a dictionary
   containing ``tag``, ``exclusive``, and ``lockers`` fields even when no clients

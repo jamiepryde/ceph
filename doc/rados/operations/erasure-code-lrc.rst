@@ -153,12 +153,85 @@ Where:
 :Required: No.
 :Default: /usr/lib/ceph/erasure-code
 
+``layer-plugin={plugin}``
+
+:Description: The erasure code plugin used for any layer that does not set
+              its own ``plugin`` (see `Low Level Plugin Configuration`_).
+              ``jerasure`` and ``isa`` are *not* interchangeable: they agree
+              on the first coding chunk but diverge on later ones, so a pool
+              must always be read and recovered with the same sub-plugin it
+              was written with. See `Choosing the layer sub-plugin`_.
+
+:Type: String
+:Required: No.
+:Default: isa
+
 ``--force``
 
 :Description: Override an existing profile by the same name.
 
 :Type: String
 :Required: No.
+
+Choosing the layer sub-plugin
+=============================
+
+Each LRC layer is itself an erasure code computed by another plugin. By
+default the *lrc* plugin uses *isa* for any layer that does not set its own
+``plugin``. The two candidate sub-plugins, ``jerasure`` and ``isa``, compute
+identical first coding chunks but **diverge on subsequent coding chunks**.
+A pool must therefore always be recovered and read with the same sub-plugin
+it was written with.
+
+To make this unambiguous, the sub-plugin is recorded in the profile under the
+``layer-plugin`` key. New LRC profiles created without an explicit value
+default to ``isa``. A profile with no ``layer-plugin`` set is rejected when
+creating a pool, and an OSD will not start the PGs of a pool whose LRC profile
+leaves it unset, and logs a warning until the key is set.
+
+.. note::
+
+   Releases before Tentacle did not record ``layer-plugin`` and always used
+   ``jerasure``. Before upgrading a cluster that has LRC pools to Tentacle or
+   later (including point-release upgrades between Tentacle builds), set
+   ``layer-plugin`` on every LRC profile so the correct sub-plugin is
+   preserved. Use the value the data was actually written with:
+
+   * ``jerasure`` for a profile describing data created before Tentacle;
+   * ``isa`` otherwise, including profiles created on an existing Tentacle
+     cluster -- every Tentacle release defaulted to ``isa``,
+     so any pool created on Tentacle was written with ``isa``.
+
+   Because ``erasure-code-profile set`` replaces the whole profile, read the
+   current settings first and re-specify them all:
+
+   .. prompt:: bash #
+
+      ceph osd erasure-code-profile get {name}
+      ceph osd erasure-code-profile set {name} <all existing settings> \
+         layer-plugin=<jerasure|isa> --force --yes-i-really-mean-it
+
+   cephadm blocks ``ceph orch upgrade start`` (and pauses an in-progress
+   upgrade with the ``UPGRADE_LRC_LAYER_PLUGIN_UNSET`` health alert) while any
+   LRC profile is missing ``layer-plugin``.
+
+.. note::
+
+   If a cluster was upgraded without setting ``layer-plugin`` first, the OSDs
+   still start but skip the PGs of the affected LRC pools (which therefore
+   become unavailable) and log a warning. To recover, set ``layer-plugin`` on
+   the affected profile(s) as above and then restart the OSDs: on restart they
+   pick up the now-complete profile from the current map and load the PGs
+   normally.
+
+.. note::
+
+   Do not create new LRC pools during an upgrade until every OSD has been
+   upgraded. An upgraded monitor stamps ``layer-plugin=isa`` into a new profile,
+   but pre-Tentacle OSDs do not understand the key and write the layers with
+   their old default (``jerasure``); data written in that window would then be
+   read with the wrong sub-plugin once those OSDs upgrade. Wait until the OSD
+   upgrade is complete before creating LRC pools.
 
 Low Level Plugin Configuration
 ==============================
