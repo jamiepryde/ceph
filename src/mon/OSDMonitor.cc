@@ -78,6 +78,7 @@
 #include "common/debug.h"
 #include "common/errno.h"
 
+#include "erasure-code/lrc/ErasureCodeLrcLayers.h"
 #include "erasure-code/ErasureCodePlugin.h"
 #include "compressor/Compressor.h"
 #include "common/Checksummer.h"
@@ -8369,6 +8370,25 @@ int OSDMonitor::prepare_new_pool(string& name,
     *ss << "'fast_read' can only apply to erasure coding pool";
     return -EINVAL;
   }
+  // This only fires for a profile left keyless, or given an invalid value, by
+  // a release that ignored layer-plugin
+  if (pool_type == pg_pool_t::TYPE_ERASURE &&
+      !g_conf().get_val<bool>("mon_debug_allow_lrc_without_layer_plugin") &&
+      osdmap.has_erasure_code_profile(erasure_code_profile) &&
+      ceph::lrc_profile_layer_plugin_unusable(
+        osdmap.get_erasure_code_profile(erasure_code_profile))) {
+    *ss << "erasure-code profile '" << erasure_code_profile << "' "
+	<< ceph::lrc_layer_plugin_problem(
+	     osdmap.get_erasure_code_profile(erasure_code_profile))
+	<< "; set it on the profile before "
+	<< "creating a pool. Use the value the profile was created with "
+	<< "('jerasure' if it describes data created before tentacle, 'isa' "
+	<< "otherwise), re-specifying the full profile: 'ceph osd "
+	<< "erasure-code-profile set " << erasure_code_profile << " ... "
+	<< ceph::LRC_LAYER_PLUGIN_KEY << "=<jerasure|isa> --force "
+	<< "--yes-i-really-mean-it'. See the release notes for tracker 81369.";
+    return -EINVAL;
+  }
   int r;
   r = prepare_pool_crush_rule(pool_type, erasure_code_profile,
 				 crush_rule_name, &crush_rule, ss);
@@ -12120,6 +12140,16 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       dout(20) << "erasure code profile " << name << " try again" << dendl;
       goto wait;
     } else {
+      if (!g_conf().get_val<bool>("mon_debug_allow_lrc_without_layer_plugin")) {
+	// Default layer-plugin for a new LRC profile; an override keeps the
+	// value already recorded rather than guessing one
+	const ErasureCodeProfile *existing_profile =
+	  osdmap.has_erasure_code_profile(name) ?
+	    &osdmap.get_erasure_code_profile(name) : nullptr;
+	err = ceph::resolve_lrc_layer_plugin(existing_profile, profile_map, &ss);
+	if (err)
+	  goto reply_no_propose;
+      }
       err = normalize_profile(name, profile_map, force, &ss);
       if (err)
 	goto reply_no_propose;
@@ -12127,13 +12157,21 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       if (osdmap.has_erasure_code_profile(name)) {
 	ErasureCodeProfile existing_profile_map =
 	  osdmap.get_erasure_code_profile(name);
-	err = normalize_profile(name, existing_profile_map, force, &ss);
-	if (err)
-	  goto reply_no_propose;
+	// An LRC profile with an invalid layer-plugin (stored by a release that
+	// ignored the key) cannot be instantiated, so it is not normalized; it
+	// differs from any valid proposal and can only be replaced with --force
+	const bool existing_invalid =
+	  ceph::lrc_profile_layer_plugin_unusable(existing_profile_map) &&
+	  !ceph::lrc_profile_missing_layer_plugin(existing_profile_map);
+	if (!existing_invalid) {
+	  err = normalize_profile(name, existing_profile_map, force, &ss);
+	  if (err)
+	    goto reply_no_propose;
 
-	if (existing_profile_map == profile_map) {
-	  err = 0;
-	  goto reply_no_propose;
+	  if (existing_profile_map == profile_map) {
+	    err = 0;
+	    goto reply_no_propose;
+	  }
 	}
 
 	if (!force) {
@@ -12149,6 +12187,35 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
 	  ss << "overriding erasure code profile can be DANGEROUS"
 	     << "; add --yes-i-really-mean-it to do it anyway";
 	  goto reply_no_propose;
+	}
+
+	// Changing the sub-plugin of a profile in use re-reads data already
+	// written with the old one; say so (rs only keeps the first line)
+	auto old_lp = existing_profile_map.find(ceph::LRC_LAYER_PLUGIN_KEY);
+	auto new_lp = profile_map.find(ceph::LRC_LAYER_PLUGIN_KEY);
+	if (ceph::is_lrc_profile(existing_profile_map) &&
+	    !ceph::lrc_profile_layer_plugin_unusable(existing_profile_map) &&
+	    new_lp != profile_map.end() && new_lp->second != old_lp->second) {
+	  list<string> users;
+	  for (const auto& [id, pool] : osdmap.get_pools()) {
+	    if (pool.is_erasure() && pool.erasure_code_profile == name) {
+	      users.push_back(osdmap.get_pool_name(id));
+	    }
+	  }
+	  if (!users.empty()) {
+	    ostringstream warn;
+	    warn << "changed " << ceph::LRC_LAYER_PLUGIN_KEY << " of "
+		 << "erasure code profile " << name << " from " << old_lp->second
+		 << " to " << new_lp->second << " while pool(s) "
+		 << boost::algorithm::join(users, ", ") << " use it. Data already "
+		 << "written with " << old_lp->second << " will be decoded with "
+		 << new_lp->second << ", which corrupts it unless "
+		 << new_lp->second << " is what wrote it. Restart every OSD "
+		 << "serving these pools to apply the change.";
+	    // Also in the cluster log, as a record of when the sub-plugin changed
+	    mon.clog->warn() << warn.str();
+	    ss << "WARNING: " << warn.str();
+	  }
 	}
       }
 
