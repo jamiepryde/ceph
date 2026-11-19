@@ -860,6 +860,12 @@ void librados::NObjectIteratorImpl::get_next()
   int ret = rados_nobjects_list_next2(ctx.get(), &entry, &key, &nspace,
                                       &entry_size, &key_size, &nspace_size);
   if (ret == -ENOENT) {
+    // The end of the listing: the end of the pool, or the pool was deleted
+    // while it was being listed. Only at_end() ends the iteration, and the
+    // Objecter does not set it when the pool is gone; without this the
+    // caller keeps reading cur_obj, which is still the previous entry (or
+    // empty, on the first call).
+    ctx->nlc->at_end_of_pool = true;
     return;
   }
   else if (ret) {
