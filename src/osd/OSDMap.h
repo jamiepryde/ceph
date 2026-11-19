@@ -1656,8 +1656,10 @@ public:
   void print(CephContext *cct, std::ostream& out) const;
   void print_osd(int id, std::ostream& out) const;
   void print_osds(std::ostream& out) const;
+  /// flat: every pool under its own id, as osd dump has always shown them
   void print_pools(CephContext *cct, std::ostream& out,
-                   bool show_rule_names = false, bool show_all = false) const;
+                   bool show_rule_names = false, bool show_all = false,
+                   bool flat = false) const;
   void print_summary(ceph::Formatter *f, std::ostream& out,
 		     const std::string& prefix, bool extra=false) const;
   void print_oneline_summary(std::ostream& out) const;

@@ -4680,7 +4680,8 @@ string OSDMap::get_flag_string() const
 }
 
 void OSDMap::print_pools(CephContext *cct, ostream& out,
-                         bool show_rule_names, bool show_all) const
+                         bool show_rule_names, bool show_all,
+                         bool flat) const
 {
   const CrushWrapper *crush_for_names = show_rule_names ? crush.get() : nullptr;
   // Emits the full detail line for pool epid with the given indent prefix.
@@ -4718,6 +4719,11 @@ void OSDMap::print_pools(CephContext *cct, ostream& out,
   std::vector<int64_t> displayed_pools;
 
   for (const auto &[pid, pdata] : pools) {
+    if (flat) {
+      emit_pool(pid, "");
+      continue;
+    }
+
     // Without --show-all, suppress source/intermediate pools and only
     // show the tip of each migration chain (the target pool).
     if (!show_all && pdata.is_migration_src()) {
@@ -4867,7 +4873,9 @@ void OSDMap::print(CephContext *cct, ostream& out) const
   }
   out << "\n";
 
-  print_pools(cct, out);
+  // osd dump is a raw view of the map: show every pool, including migration
+  // source stubs, under its own id, as the JSON form does.
+  print_pools(cct, out, false, false, true);
 
   out << "max_osd " << get_max_osd() << "\n";
   print_osds(out);
