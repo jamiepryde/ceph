@@ -10884,10 +10884,22 @@ void PrimaryLogPG::finish_copyfrom(CopyFromCallback *cb)
   obs.oi.truncate_seq = cb->truncate_seq;
   obs.oi.truncate_size = cb->truncate_size;
   if (cb->pool_migration) {
-    if (!cb->results->watchers.empty()) {
-      dout(10) << __func__ << " migrating watchers on " << obs.oi.soid << dendl;
-    }
     obs.oi.watchers = cb->results->watchers;
+    if (!obs.oi.watchers.empty()) {
+      dout(10) << __func__ << " migrating watchers on " << obs.oi.soid << dendl;
+      // The obc was created before the object existed here, so it has no
+      // Watch objects and notifies would see no watchers until each client
+      // re-registers. Load them once the copy is applied, as
+      // get_object_context() does for an object read from disk, so notifies
+      // wait for the watchers to reconnect.
+      ObjectContextRef obc = ctx->obc;
+      ctx->register_on_success([this, obc]() {
+        if (is_primary() && is_active() && obc->obs.exists &&
+            obc->watchers.empty()) {
+          populate_obc_watchers(obc);
+        }
+      });
+    }
   }
 
   obs.oi.mtime = ceph::real_clock::to_timespec(cb->results->mtime);
