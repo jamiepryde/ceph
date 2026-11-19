@@ -1628,6 +1628,16 @@ bool pool_opts_t::is_set(pool_opts_t::key_t key) const
   return opts.count(key);
 }
 
+void pool_opts_t::inherit_unset(const pool_opts_t& other,
+                                const std::set<key_t>& skip)
+{
+  for (const auto& [key, value] : other.opts) {
+    if (!skip.contains(key)) {
+      opts.emplace(key, value);
+    }
+  }
+}
+
 const pool_opts_t::value_t& pool_opts_t::get(pool_opts_t::key_t key) const
 {
   auto i = opts.find(key);

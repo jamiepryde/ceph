@@ -1175,6 +1175,9 @@ public:
 
   bool unset(key_t key);
 
+  /// copy every option set in other and not set here, except those in skip
+  void inherit_unset(const pool_opts_t& other, const std::set<key_t>& skip);
+
   void dump(const std::string& name, ceph::Formatter *f) const;
 
   void dump(ceph::Formatter *f) const;

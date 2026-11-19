@@ -8967,6 +8967,17 @@ int OSDMonitor::prepare_new_pool(string& name,
       }
     }
 
+    // Inherit what the command cannot set. Tag-based cephx caps depend on
+    // the application metadata. The pg_num and target size options were
+    // inherited (or given) on the command line.
+    pi->application_metadata = spi->application_metadata;
+    pi->quota_max_bytes = spi->quota_max_bytes;
+    pi->quota_max_objects = spi->quota_max_objects;
+    pi->opts.inherit_unset(spi->opts, {pool_opts_t::PG_NUM_MIN,
+                                       pool_opts_t::PG_NUM_MAX,
+                                       pool_opts_t::TARGET_SIZE_BYTES,
+                                       pool_opts_t::TARGET_SIZE_RATIO});
+
     spi->migration_src.reset();
     spi->migration_target = pool;
     pi->migration_src = source_pool_id.value();
@@ -14727,15 +14738,17 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     auto pg_num_max = cmd_getval_or<int64_t>(cmdmap, "pg_num_max", 0);
     auto pgp_num = cmd_getval_or<int64_t>(cmdmap, "pgp_num", pg_num);
 
+    // With a source pool (osd pool migrate), every value that is not given
+    // on the command line is inherited from the source.
     bool pg_fields_set = (pg_num != 0) || (pg_num_min != 0) || (pg_num_max != 0) || (pgp_num != 0);
-    if (source_pool && !pg_fields_set && (migrate_no_params || !is_migrate)) {
+    if (source_pool && !pg_fields_set) {
       pg_num = source_pool->get_pg_num();
       pg_num_min = source_pool->get_pg_num_min();
       pg_num_max = source_pool->get_pg_num_max();
       pgp_num = pg_num;
     }
 
-    bool inherit_type = source_pool && (migrate_no_params || !is_migrate);
+    bool inherit_type = source_pool != nullptr;
     default_type_str = inherit_type ? string(source_pool->get_type_name())
                                     : g_conf().get_val<string>("osd_pool_default_type");
     bool pool_type_explicit = cmd_getval(cmdmap, "pool_type", pool_type_str);
@@ -14753,7 +14766,15 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       goto reply_no_propose;
     }
 
-    bool enable_ec_optimizations = cmd_getval_or<bool>(cmdmap, "enable_ec_optimizations", false);
+    // Inherit type-specific parameters from the source when the types match.
+    bool types_match = source_pool &&
+                       (static_cast<unsigned>(pool_type) == source_pool->get_type());
+
+    bool default_ec_optimizations = types_match &&
+                                    pool_type == pg_pool_t::TYPE_ERASURE &&
+                                    source_pool->allows_ecoptimizations();
+    bool enable_ec_optimizations = cmd_getval_or<bool>(cmdmap, "enable_ec_optimizations",
+                                                       default_ec_optimizations);
     if (source_pool) {
       bool source_not_legacy_ec = source_pool->get_type() == pg_pool_t::TYPE_REPLICATED ||
         source_pool->allows_ecoptimizations();
@@ -14770,13 +14791,7 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
       }
     }
 
-    // Inherit type-specific parameters from the source when:
-    //   - osd pool create (with source) and types match, or
-    //   - osd pool migrate with no params given and types match.
-    bool types_match = source_pool && (migrate_no_params || !is_migrate) &&
-                       (static_cast<unsigned>(pool_type) == source_pool->get_type());
-
-    bool inherit_from_source = source_pool && (migrate_no_params || !is_migrate);
+    bool inherit_from_source = source_pool != nullptr;
     int64_t default_expected_num_objects = inherit_from_source ? source_pool->expected_num_objects : 0;
     
     // Only inherit erasure code profile if pool types match (and source is EC)
