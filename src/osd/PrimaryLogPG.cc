@@ -16774,11 +16774,19 @@ uint64_t PrimaryLogPG::recover_pool_migration(
       int r = pgbackend->objects_list_range(hobject_t(), pg_end, &remaining);
       ceph_assert(r >= 0);
       if (!remaining.empty()) {
+        // Every OSD that becomes primary would hit this again, so aborting
+        // would take the PG down for good. Stop the migration with an error
+        // instead and leave the PG serving I/O.
         derr << __func__ << " pg " << info.pgid
              << " pool migration complete but PG is not empty."
              << " remaining=" << remaining
              << dendl;
-        ceph_abort_msg("pool migration finished with objects in the source PG");
+        osd->clog->error() << "pg " << info.pgid
+                           << " pool migration finished but "
+                           << remaining.size()
+                           << " object(s) remain in the source PG";
+        stop_pool_migration_error(-ENOTEMPTY);
+        return ops;
       }
 
       if (pool_migration_target_pg.has_value()) {
