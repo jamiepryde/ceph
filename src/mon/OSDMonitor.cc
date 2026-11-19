@@ -14920,6 +14920,13 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
     bool default_crimson = inherit_from_source ? source_pool->is_crimson() : false;
     bool crimson = cmd_getval_or<bool>(cmdmap, "crimson", default_crimson) ||
       cct->_conf.get_val<bool>("osd_pool_default_crimson");
+    if (source_pool && (crimson || source_pool->is_crimson())) {
+      // The crimson OSD does not implement pool migration yet; its hooks
+      // are stubs that abort.
+      ss << "pool migration is not supported for crimson pools";
+      err = -EOPNOTSUPP;
+      goto reply_no_propose;
+    }
     bool force_create = false;
     cmd_getval(cmdmap, "force_pg_limit", force_create);
 
