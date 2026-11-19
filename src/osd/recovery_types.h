@@ -234,7 +234,6 @@ template <> struct fmt::formatter<PrimaryBackfillInterval> : fmt::ostream_format
 template <> struct fmt::formatter<ReplicaBackfillInterval> : fmt::ostream_formatter {};
 #endif
 
-// TODO check if this is correct
 #if FMT_VERSION >= 110104
 template <> struct fmt::formatter<PoolMigrationInterval> : fmt::ostream_formatter {};
 #endif
