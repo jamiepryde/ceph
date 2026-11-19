@@ -14418,11 +14418,13 @@ void PrimaryLogPG::on_change(ObjectStore::Transaction &t)
   pool_migration_uncommitted_watermarks.clear();
   dout(20) << __func__ << " on_change, cancelling remote recovery reservation" << dendl;
   cancel_remote_recovery_reservation();
-  if (pool_migration_reservations_granted_target) {
-    dout(20) << __func__ << " on_change, target PG unreserving space" << dendl;
-    unreserve_recovery_space();
-    pool_migration_reservations_granted_target = false;
-  }
+  // Unreserve even if the reservation was never granted: a target primary
+  // part way through WaitRemotePoolMigrationReserved has already reserved
+  // its own space. Every reservation is renegotiated after an interval
+  // change, so this cannot drop one that is still needed.
+  dout(20) << __func__ << " on_change, unreserving recovery space" << dendl;
+  unreserve_recovery_space();
+  pool_migration_reservations_granted_target = false;
   // Requeue rather than drop the source PGs' reservation requests. The
   // source only resends them if this PG's primary changes, so a dropped
   // request leaves it waiting forever. Requeued requests are answered in
