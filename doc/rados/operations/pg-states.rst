@@ -113,6 +113,25 @@ map is ``active+clean``.
 *snaptrim_error*
   Error stopped trimming snaps.
 
+*migration_wait*
+  The placement group is waiting to start, or to resume, migrating its objects
+  to the target pool of a pool migration. See :ref:`migratepool`.
+
+*migrating*
+  The placement group is migrating its objects to the target pool of a pool
+  migration.
+
+*migration_toofull*
+  Pool migration is waiting because the OSDs of the target placement group are
+  too full.
+
+*migration_unfound*
+  Pool migration has stopped because an object to be migrated could not be
+  read.
+
+*migration_error*
+  Pool migration has stopped because of an error other than the above.
+
 *unknown*
   The ceph-mgr hasn't yet received any information about the PG's state from an
   OSD since mgr started up.
