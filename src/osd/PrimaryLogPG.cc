@@ -1708,6 +1708,13 @@ void PrimaryLogPG::do_pg_op(OpRequestRef op, ThreadPool::TPHandle *handle)
           break;
         }
 
+        if (!m->get_source().is_osd()) {
+          dout(0) << __func__ << " rejecting PG_POOL_MIGRATION_RESERVE from "
+                  << m->get_source() << dendl;
+          result = -EPERM;
+          break;
+        }
+
         if (!pool.info.is_migration_target()) {
           // Our map may be behind the source's, or the migration may have
           // completed. Either way the source must hear back, or it waits
@@ -1754,6 +1761,13 @@ void PrimaryLogPG::do_pg_op(OpRequestRef op, ThreadPool::TPHandle *handle)
     case CEPH_OSD_OP_PG_POOL_MIGRATION_RELEASE:
       {
         dout(20) << __func__ << " target CEPH_OSD_OP_PG_POOL_MIGRATION_RELEASE" << dendl;
+
+        if (!m->get_source().is_osd()) {
+          dout(0) << __func__ << " rejecting PG_POOL_MIGRATION_RELEASE from "
+                  << m->get_source() << dendl;
+          result = -EPERM;
+          break;
+        }
 
         if (pool_migration_reservations_granted_target) {
           stop_target_pool_migration();
@@ -2134,6 +2148,27 @@ bool PrimaryLogPG::should_use_coroutine(MOSDOp* m)
   return false;
 }
 
+// Ops that only the source PG of a pool migration sends to the target.
+static bool is_pool_migration_internal_op(const OpRequestRef& op,
+                                          const MOSDOp *m)
+{
+  if (op->may_write() && m->has_flag(CEPH_OSD_FLAG_MAP_SNAP_CLONE)) {
+    return true;
+  }
+  for (const auto& osd_op : m->ops) {
+    if ((osd_op.op.op == CEPH_OSD_OP_COPY_FROM ||
+         osd_op.op.op == CEPH_OSD_OP_COPY_FROM2) &&
+        ((osd_op.op.copy_from.flags &
+          (CEPH_OSD_COPY_FROM_FLAG_POOL_MIGRATION |
+           CEPH_OSD_COPY_FROM_FLAG_POOL_MIGRATION_HAS_RES)) ||
+         (osd_op.op.copy_from.flags2 &
+          CEPH_OSD_COPY_FROM_FLAG2_POOL_MIGRATION_HAS_CLONES))) {
+      return true;
+    }
+  }
+  return false;
+}
+
 void PrimaryLogPG::do_op_impl(OpRequestRef op, ThreadPool::TPHandle *handle)
 {
   MOSDOp *m = static_cast<MOSDOp*>(op->get_nonconst_req());
@@ -2322,6 +2357,15 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op, ThreadPool::TPHandle *handle)
     }
     return;
   }
+  // Only the source PG of a pool migration may send these. They write to
+  // clones, skip the usual snap context handling and replace whole objects.
+  if (!m->get_source().is_osd() && is_pool_migration_internal_op(op, m)) {
+    dout(10) << __func__ << " rejecting pool migration op from "
+             << m->get_source() << ": " << *m << dendl;
+    osd->reply_op_error(op, -EPERM);
+    return;
+  }
+
   if (op->may_write()) {
 
     // invalid?
