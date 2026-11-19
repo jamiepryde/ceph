@@ -2482,6 +2482,25 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op, ThreadPool::TPHandle *handle)
     bool migrated = m->get_hobj().is_snap() ?
                     m->get_hobj().get_head() < pool_migration_watermark.get_head() :
                     m->get_hobj() < pool_migration_watermark;
+    if (migrated && !pool_migration_uncommitted_watermarks.empty()) {
+      // A source delete that moved the watermark past this object has not
+      // committed yet. If the primary fails before it does, peering can roll
+      // the delete back and the watermark with it, and the target pool would
+      // then discard anything written there in the meantime. Wait for the
+      // commit before redirecting.
+      const hobject_t &lowest = pool_migration_uncommitted_watermarks.begin()->second;
+      bool uncommitted = m->get_hobj().is_snap() ?
+                         m->get_hobj().get_head() >= lowest.get_head() :
+                         m->get_hobj() >= lowest;
+      if (uncommitted) {
+        dout(20) << __func__ << ": object " << m->get_hobj()
+                 << " waiting for source delete of " << lowest
+                 << " to commit before redirecting" << dendl;
+        waiting_for_pool_migration_commit.push_back(op);
+        op->mark_delayed("waiting for pool migration delete to commit");
+        return;
+      }
+    }
     if (migrated) {
       // object has been migrated to the target pool - request
       // Op is redirected and provide client with updated
@@ -12279,6 +12298,10 @@ void PrimaryLogPG::eval_repop(RepGather *repop)
   // ondisk?
   if (repop->all_committed) {
     dout(10) << " commit: " << *repop << dendl;
+    if (pool_migration_uncommitted_watermarks.erase(repop->v)) {
+      // a delete that moved the migration watermark is now durable
+      requeue_ops(waiting_for_pool_migration_commit);
+    }
     for (auto p = repop->on_committed.begin();
 	 p != repop->on_committed.end();
 	 repop->on_committed.erase(p++)) {
@@ -13971,10 +13994,15 @@ hobject_t PrimaryLogPG::next_pool_migration(std::optional<hobject_t> start)
   return current;
 }
 
-std::optional<hobject_t> PrimaryLogPG::consider_updating_migration_watermark(std::set<hobject_t> &deleted)
+std::optional<hobject_t> PrimaryLogPG::consider_updating_migration_watermark(
+  std::set<hobject_t> &deleted,
+  const eversion_t &version)
 {
   if (deleted.contains(pool_migration_watermark)) {
     hobject_t current(pool_migration_watermark);
+    // The watermark moves at submit time. Remember where it was until this
+    // delete commits on every shard; see do_op().
+    pool_migration_uncommitted_watermarks.emplace(version, current);
     do {
       update_range(&pool_migration_info, nullptr);
       dout(20) << __func__ << " deleting object " << current << dendl;
@@ -14239,6 +14267,7 @@ void PrimaryLogPG::on_change(ObjectStore::Transaction &t)
   requeue_ops(waiting_for_flush);
   requeue_ops(waiting_for_active);
   requeue_ops(waiting_for_readable);
+  requeue_ops(waiting_for_pool_migration_commit);
   requeue_ops(waiting_for_coro_op);
   if (active_coro_op) {
     requeue_op(active_coro_op);
@@ -14335,6 +14364,7 @@ void PrimaryLogPG::on_change(ObjectStore::Transaction &t)
 
   // clear pool migration state
   pool_migration_blocked_writes.clear();
+  pool_migration_uncommitted_watermarks.clear();
   dout(20) << __func__ << " on_change, cancelling remote recovery reservation" << dendl;
   cancel_remote_recovery_reservation();
   if (pool_migration_reservations_granted_target) {
