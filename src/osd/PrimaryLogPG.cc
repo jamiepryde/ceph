@@ -16404,6 +16404,39 @@ void PrimaryLogPG::kick_pool_migration_blocked_writes()
   }
 }
 
+void PrimaryLogPG::drop_pool_migration_heads_without_ops()
+{
+  // A head stays in pool_migrations_in_flight after its own copy completes,
+  // until its clones have been copied and recover_pool_migration() reaches
+  // its DELETE_HEAD step. Neither happens while quiescing, so unless a copy
+  // for one of its clones is still outstanding (whose failure path drops the
+  // head), nothing would ever remove it and the quiesce would never drain.
+  // The new-interval path drops these heads in clear_recovery_state().
+  for (auto it = pool_migration_clones_in_flight.begin();
+       it != pool_migration_clones_in_flight.end(); ) {
+    const hobject_t head = it->first;
+    bool clone_copy_outstanding = false;
+    for (const auto& [oid, tid] : pool_migration_copy_tids) {
+      if (oid.is_snap() && oid.get_head() == head) {
+        clone_copy_outstanding = true;
+        break;
+      }
+    }
+    if (clone_copy_outstanding ||
+        pool_migration_head_copy_in_flight.count(head) ||
+        !pool_migrations_in_flight.count(head)) {
+      ++it;
+      continue;
+    }
+    dout(10) << __func__ << " dropping " << head
+             << " with no outstanding op from in-flight set" << dendl;
+    pgbackend->cancel_recovery_op(head);
+    release_recovering(head);
+    pool_migrations_in_flight.erase(head);
+    it = pool_migration_clones_in_flight.erase(it);
+  }
+}
+
 void PrimaryLogPG::handle_pool_migration_quiesce_complete()
 {
   dout(10) << __func__ << " all migrations drained, quiesce_reason="
@@ -16561,6 +16594,7 @@ void PrimaryLogPG::handle_pool_migration_copy_failure(hobject_t oid, int r, bool
 
   // Remove the failed object from in-flight tracking
   pool_migrations_in_flight.erase(oid);
+  drop_pool_migration_heads_without_ops();
 
   // For retryable errors, reset last_pool_migration_started so recover_pool_migration
   // will retry this object after quiesce completes and reservation is granted
@@ -17012,6 +17046,8 @@ void PrimaryLogPG::on_pool_migration_source_suspended()
     pool_migrations_in_flight.erase(pending_oid);
     dout(20) << __func__ << " flushed pending delete for " << pending_oid << dendl;
   }
+
+  drop_pool_migration_heads_without_ops();
 
   // Flush may have abandoned copies without advancing the watermark, so rewind
   last_pool_migration_started = pool_migration_watermark;
