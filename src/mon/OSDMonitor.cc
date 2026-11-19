@@ -14593,6 +14593,20 @@ bool OSDMonitor::prepare_command_impl(MonOpRequestRef op,
         goto reply_no_propose;
       }
 
+      // A migration of this pool may already be pending, for example when
+      // the command is resent. Wait for it to commit before changing
+      // anything: renaming the pool here would replace its pending rename,
+      // and the rollback at wait/reply_no_propose would then remove it
+      // altogether, leaving the source and the target with the same name.
+      if (pending_inc.new_pool_names.count(pool_id)) {
+        goto wait;
+      }
+      for (auto& [id, name] : pending_inc.new_pool_names) {
+        if (name == poolstr) {
+          goto wait;
+        }
+      }
+
       string old_pool_name;
       int suffix_iter = 1;
       while (true) {
