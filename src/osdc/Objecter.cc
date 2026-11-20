@@ -3431,6 +3431,22 @@ int Objecter::_calc_target(op_target_t *t, snapid_t snap, bool any_change)
       }
     }
   }
+  // The OSD discards ops sent before the last_force_op_resend of the pool it
+  // receives them in, which a pool migration can make a different pool from
+  // the base pool: with cascaded migrations the base pool is the chain root,
+  // and the monitor only sets last_force_op_resend on the source and target
+  // of the current step. Resend on the target pool's force too, or a write
+  // sent just before it is dropped and never resent while later writes to the
+  // same object complete.
+  if (t->target_oloc.pool != t->base_oloc.pool &&
+      osdmap->get_epoch() == pi->last_force_op_resend) {
+    if (t->last_force_resend < pi->last_force_op_resend) {
+      t->last_force_resend = pi->last_force_op_resend;
+      force_resend = true;
+    } else if (t->last_force_resend == 0) {
+      force_resend = true;
+    }
+  }
   ldout(cct,20) << __func__ << " target " << t->target_oid << " "
 		<< t->target_oloc << " -> pgid " << pgid << dendl;
   ldout(cct,30) << __func__ << "  target pi " << pi
