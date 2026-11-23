@@ -16038,20 +16038,26 @@ struct C_Migrate : public Context {
     if (r < 0) {
       pg->handle_pool_migration_copy_failure(oid, r, stale);
       if (oid.is_snap()) {
-        // Abandon migrating head object as well
+        // Abandon the migrating head object as well, unless its own copy is
+        // still outstanding: clone copies start as soon as the head's copy is
+        // sent, so a clone can complete first. The head's C_Migrate drops it
+        // and finishes its recovery op; dropping it here would end the
+        // quiesce with that copy in flight and leave the recovery op open.
         auto head = oid.get_head();
-        if (!stale) {
-          pg->pgbackend->cancel_recovery_op(head);
-          pg->release_recovering(head);
-        }
-        pg->pool_migrations_in_flight.erase(head);
-        // handle_pool_migration_copy_failure already checked for quiesce
-        // completion, but it ran before we removed the head here.  Check
-        // again now that the set may be empty.
-        if (pg->pool_migration_quiesce_reason !=
-            PrimaryLogPG::PoolMigrationQuiesceReason::NONE &&
-            pg->pool_migrations_in_flight.empty()) {
-          pg->handle_pool_migration_quiesce_complete();
+        if (!pg->pool_migration_head_copy_in_flight.count(head)) {
+          if (!stale) {
+            pg->pgbackend->cancel_recovery_op(head);
+            pg->release_recovering(head);
+          }
+          pg->pool_migrations_in_flight.erase(head);
+          // handle_pool_migration_copy_failure already checked for quiesce
+          // completion, but it ran before we removed the head here.  Check
+          // again now that the set may be empty.
+          if (pg->pool_migration_quiesce_reason !=
+              PrimaryLogPG::PoolMigrationQuiesceReason::NONE &&
+              pg->pool_migrations_in_flight.empty()) {
+            pg->handle_pool_migration_quiesce_complete();
+          }
         }
       }
     } else if (action == COPY_DELETE_NEXT) {
