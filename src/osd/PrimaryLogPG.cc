@@ -2528,6 +2528,18 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op, ThreadPool::TPHandle *handle)
     bool migrated = m->get_hobj().is_snap() ?
                     m->get_hobj().get_head() < pool_migration_watermark.get_head() :
                     m->get_hobj() < pool_migration_watermark;
+    if (migrated && !is_primary()) {
+      // A replica applies a watermark advance when the repop arrives, before
+      // it has committed, and can't tell when it does. A redirect from here
+      // could give the client a watermark that peering later rolls back.
+      // Bounce the read so the client retries on the primary, which only
+      // hands out a committed watermark.
+      dout(20) << __func__ << ": object " << m->get_hobj()
+               << " has been migrated, returning EAGAIN to send the read"
+               << " to the primary" << dendl;
+      osd->reply_op_error(op, -EAGAIN);
+      return;
+    }
     if (migrated && !pool_migration_uncommitted_watermarks.empty()) {
       // A source delete that moved the watermark past this object has not
       // committed yet. If the primary fails before it does, peering can roll
@@ -2550,17 +2562,24 @@ void PrimaryLogPG::do_op_impl(OpRequestRef op, ThreadPool::TPHandle *handle)
     if (migrated) {
       // object has been migrated to the target pool - request
       // Op is redirected and provide client with updated
-      // migration watermark
+      // migration watermark. The client caches the watermark and sends
+      // later ops below it straight to the target pool, so it must not
+      // include an advance that is still uncommitted: use the watermark
+      // from before the oldest uncommitted advance.
+      const hobject_t &committed_watermark =
+        pool_migration_uncommitted_watermarks.empty() ?
+          pool_migration_watermark :
+          pool_migration_uncommitted_watermarks.begin()->second;
       dout(20) << __func__ << ": object " << m->get_hobj()
 	       << " has been migrated to pool " << *pi->migration_target
-               << " watermark " << pool_migration_watermark << dendl;
+               << " watermark " << committed_watermark << dendl;
       auto m = op->get_req<MOSDOp>();
       int flags = m->get_flags() & (CEPH_OSD_FLAG_ACK|CEPH_OSD_FLAG_ONDISK);
       MOSDOpReply *reply = new MOSDOpReply(m, -ENOENT, get_osdmap_epoch(),
                                        flags, false);
       request_redirect_t redir(m->get_object_locator(),
 			       *pool.info.migration_target,
-			       pool_migration_watermark);
+			       committed_watermark);
       reply->set_redirect(redir);
       m->get_connection()->send_message(reply);
       return;
