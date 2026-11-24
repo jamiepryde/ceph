@@ -1708,7 +1708,8 @@ static int64_t pending_backfill(CephContext *cct, int64_t bf_bytes, int64_t loca
 // However, setting above zero reserves space for backfill and requires
 // the OSDService::stat_lock which protects all OSD usage
 bool PG::try_reserve_recovery_space(
-  int64_t primary_bytes, int64_t local_bytes, int64_t num_objects) {
+  int64_t primary_bytes, int64_t local_bytes, int64_t num_objects,
+  bool pool_migration) {
   // Use tentative_bacfill_full() to make sure enough
   // space is available to handle target bytes from primary.
 
@@ -1725,20 +1726,24 @@ bool PG::try_reserve_recovery_space(
   // statfs using ps->primary_bytes.
   uint64_t pending_adjustment = 0;
   if (primary_bytes) {
-    if (!num_objects) {
-      // backfill uses number of objects from the stats, pool migration
-      // tells the target PG how many objects will be migrated
-      num_objects = info.stats.stats.sum.num_objects;
-    }
-    // For erasure coded pool overestimate by a full stripe per object
-    // because we don't know how each objected rounded to the nearest stripe
-    if (pool.info.is_erasure()) {
-      primary_bytes /= (int)get_pgbackend()->get_ec_data_chunk_count();
-      primary_bytes += get_pgbackend()->get_ec_stripe_chunk_size() *
-	num_objects;
-      local_bytes /= (int)get_pgbackend()->get_ec_data_chunk_count();
-      local_bytes += get_pgbackend()->get_ec_stripe_chunk_size() *
-	num_objects;
+    if (pool_migration) {
+      // primary_bytes and num_objects are what the source will copy in. It
+      // arrives as ordinary writes, not pushes, so local_num_bytes cannot be
+      // advanced per object as backfill does. Reserve it on top of the
+      // shard's current size instead, and let
+      // update_pool_migration_local_bytes() follow the shard's size from the
+      // PG stats as the data lands.
+      local_bytes = shard_num_bytes(info.stats.stats.sum.num_bytes,
+				    info.stats.stats.sum.num_objects);
+      primary_bytes = local_bytes + shard_num_bytes(primary_bytes, num_objects);
+    } else {
+      // backfill: the primary's size and this shard's current size, both
+      // rounded up for the primary's number of objects
+      if (!num_objects) {
+	num_objects = info.stats.stats.sum.num_objects;
+      }
+      primary_bytes = shard_num_bytes(primary_bytes, num_objects);
+      local_bytes = shard_num_bytes(local_bytes, num_objects);
     }
     pending_adjustment = pending_backfill(
       cct,
@@ -1772,6 +1777,7 @@ bool PG::try_reserve_recovery_space(
     // backfill anyway.
     if (primary_bytes &&
 	!cct->_conf->osd_debug_skip_full_check_in_backfill_reservation) {
+      pool_migration_reserved.store(pool_migration);
       primary_num_bytes.store(primary_bytes);
       local_num_bytes.store(local_bytes);
     } else {
@@ -1784,6 +1790,33 @@ bool PG::try_reserve_recovery_space(
 void PG::unreserve_recovery_space() {
   primary_num_bytes.store(0);
   local_num_bytes.store(0);
+  pool_migration_reserved.store(false);
+}
+
+// For an erasure coded pool overestimate by a full stripe per object
+// because we don't know how each object rounded to the nearest stripe
+int64_t PG::shard_num_bytes(int64_t num_bytes, int64_t num_objects)
+{
+  if (!pool.info.is_erasure()) {
+    return num_bytes;
+  }
+  return num_bytes / (int)get_pgbackend()->get_ec_data_chunk_count() +
+    get_pgbackend()->get_ec_stripe_chunk_size() * num_objects;
+}
+
+// Migrated objects update the PG stats as they are written, on the primary
+// as each op is applied and on the other shards from the stats the primary
+// sends with it, but not local_num_bytes. Follow the stats, so a pool
+// migration reservation shrinks as the data lands, as a backfill
+// reservation does as pushes arrive.
+void PG::update_pool_migration_local_bytes()
+{
+  ceph_assert(ceph_mutex_is_locked_by_me(_lock));
+  if (!pool_migration_reserved.load() || primary_num_bytes.load() == 0) {
+    return;
+  }
+  local_num_bytes.store(shard_num_bytes(info.stats.stats.sum.num_bytes,
+					info.stats.stats.sum.num_objects));
 }
 
 bool PG::_scan_rollback_obs(const vector<ghobject_t> &rollback_obs)
@@ -2435,7 +2468,9 @@ std::pair<ghobject_t, bool> PG::do_delete_work(
 int PG::pg_stat_adjust(osd_stat_t *ns)
 {
   osd_stat_t &new_stat = *ns;
-  if (is_primary()) {
+  // A backfill primary receives no data, but a pool migration target's
+  // primary does, so its reservation counts.
+  if (is_primary() && !pool_migration_reserved.load()) {
     return 0;
   }
   // Adjust the kb_used by adding pending backfill data
