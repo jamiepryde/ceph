@@ -1,1 +1,11 @@
-# Pool migration disabled
+overrides:
+  rados:
+    migrate_pool: true
+  ceph:
+    conf:
+      mon:
+        mon osd initial require min compat client: vampire
+      global:
+        enable experimental unrecoverable data corrupting features: '*'
+    log-ignorelist:
+      - \(POOL_MIGRATION\)
